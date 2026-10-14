@@ -35,7 +35,7 @@ class EngineOptions {
     this.anchorChroma = 0.0,
     this.stabilize = false,
     this.smoothRadius = 15,
-    this.zoom = 1.05,
+    this.zoom = 0,
     this.maxFrames = 0,
     this.shakeThreshold = 1.0e-3,
     this.maxLongSide = 0,
@@ -50,7 +50,7 @@ class EngineOptions {
   final double dehazeChroma; // 去霧後色度取自去霧結果的比例(越小越接近原片色彩)
   final bool stabilize;
   final int smoothRadius; // 防手震平滑視窗(影格數)
-  final double zoom; // 防手震裁切放大,蓋住邊緣
+  final double zoom; // 防手震裁切放大;0 = 依修正量自動計算(剛好蓋住黑邊)
   final int maxFrames; // 只處理前 N 格(測試/預覽用),0 = 全部
   // 晃動門檻(高頻抖動 / 畫面長邊)。低於此值視為穩定、不做防手震。
   // 依實測:明顯手震約 1.6e-3,一般手持約 0.2~0.6e-3。
@@ -314,11 +314,13 @@ class _RenderJob {
     required this.frames,
     required this.options,
     required this.corrections,
+    required this.zoom,
   });
   final String inPipe, outPipe;
   final int w, h, outW, outH, frames;
   final EngineOptions options;
   final Float64List? corrections; // 每格 3 個值:dx, dy, da
+  final double zoom; // 防手震放大倍率
 }
 
 void _renderEntry((Object, SendPort) args) {
@@ -347,7 +349,7 @@ void _renderEntry((Object, SendPort) args) {
       }
 
       if (c != null && 3 * i + 2 < c.length) {
-        step(applyStabilization(cur, Motion(c[3 * i], c[3 * i + 1], c[3 * i + 2]), o.zoom));
+        step(applyStabilization(cur, Motion(c[3 * i], c[3 * i + 1], c[3 * i + 2]), job.zoom));
       }
       // 色調錨定的參照:防手震之後、除霧與畫質之前的影格(位置對得上,亮度色彩是原片的)。
       final ref = anchor != null ? cur.clone() : null;
@@ -407,6 +409,7 @@ Future<void> processVideo(
 
   try {
     Float64List? corrections;
+    var zoom = 1.0;
 
     // ---- 階段 1:防手震才需要。FFmpeg 直接輸出縮小後的灰階影格,不必在 Dart 端縮圖。 ----
     if (options.stabilize) {
@@ -446,6 +449,7 @@ Future<void> processVideo(
       if (shaky) {
         final smooth = smoothTrajectory(list, options.smoothRadius);
         corrections = Float64List.fromList([for (final m in smooth) ...[m.dx, m.dy, m.da]]);
+        zoom = options.zoom > 0 ? options.zoom : stabilizationZoom(smooth, workW, workH);
       }
     }
 
@@ -505,6 +509,7 @@ Future<void> processVideo(
         frames: frames,
         options: options,
         corrections: corrections,
+        zoom: zoom,
       ),
       report,
     ).whenComplete(() => finished = true);

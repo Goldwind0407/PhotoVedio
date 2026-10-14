@@ -4,12 +4,36 @@ import 'dart:io';
 import 'package:flutter/widgets.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'package:ffmpeg_kit_min_gpl/ffmpeg_kit.dart';
+
 import 'engine/pipeline.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final ext = (await getExternalStorageDirectory())!.path;
   final tmp = (await getTemporaryDirectory()).path;
+
+  // 偵錯模式:cmd.txt 存在時,直接執行裡面的 FFmpeg 參數(每行一個),{ext}/{tmp} 會被替換。
+  final cmdFile = File('$ext/cmd.txt');
+  if (cmdFile.existsSync()) {
+    final args = cmdFile
+        .readAsLinesSync()
+        .where((l) => l.trim().isNotEmpty)
+        .map((l) => l.trim().replaceAll('{ext}', ext).replaceAll('{tmp}', tmp))
+        .toList();
+    final sw = Stopwatch()..start();
+    final session = await FFmpegKit.executeWithArguments(args);
+    final code = await session.getReturnCode();
+    final logs = await session.getAllLogsAsString() ?? '';
+    final lines = logs.split('\n').where((l) => l.trim().isNotEmpty).toList();
+    for (final l in lines.skip(lines.length > 25 ? lines.length - 25 : 0)) {
+      debugPrint('SMOKE CMD $l');
+    }
+    debugPrint('SMOKE CMD rc=${code?.getValue()} ${sw.elapsedMilliseconds}ms '
+        'maxRssMB=${ProcessInfo.maxRss ~/ (1024 * 1024)}');
+    debugPrint('SMOKE DONE');
+    return;
+  }
   const options = EngineOptions(
     enhance: true,
     stabilize: true, // 自動判斷:只有偵測到晃動才修正

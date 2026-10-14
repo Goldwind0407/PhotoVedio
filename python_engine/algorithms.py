@@ -143,7 +143,8 @@ def apply_stabilization(frame: np.ndarray, correction: np.ndarray, zoom: float) 
     cx, cy = w / 2, h / 2
     m = np.array([[c, -s, cx - c * cx + s * cy + dx],
                   [s, c, cy - s * cx - c * cy + dy]], dtype=np.float32)
-    return cv2.warpAffine(frame, m, (w, h), flags=cv2.INTER_LINEAR,
+    # Lanczos 取樣:雙線性在放大時會把細節抹掉約三成,Lanczos 只損失約一成。
+    return cv2.warpAffine(frame, m, (w, h), flags=cv2.INTER_LANCZOS4,
                           borderMode=cv2.BORDER_REPLICATE)
 
 
@@ -211,12 +212,14 @@ class DetailEnhancer:
     """
 
     def __init__(self, fine: float = 0.6, medium: float = 0.35, smooth: float = 0.9,
-                 max_delta: float = 14.0):
+                 max_delta: float = 14.0, noise_every: int = 15):
         self.fine = fine          # 細尺度(紋理、毛髮)增強量
         self.medium = medium      # 中尺度(輪廓、局部立體感)增強量
         self.smooth = smooth
         self.max_delta = max_delta  # 單一像素最大亮度變化,避免過度銳化
+        self.noise_every = noise_every  # 每幾格重新估計一次雜訊(與 App 端相同)
         self._sigma: float | None = None
+        self._frame = 0
 
     @staticmethod
     def _base(y: np.ndarray, r: int, eps: float) -> np.ndarray:
@@ -225,9 +228,11 @@ class DetailEnhancer:
     def __call__(self, frame: np.ndarray) -> np.ndarray:
         f = frame.astype(np.float32)
         y = f @ np.array([0.114, 0.587, 0.299], np.float32)
-        small = cv2.resize(y, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        s = estimate_noise(small) * 1.4  # 縮半會降低雜訊,補回約 √2
-        self._sigma = s if self._sigma is None else self.smooth * self._sigma + (1 - self.smooth) * s
+        if self._sigma is None or self._frame % self.noise_every == 0:
+            small = cv2.resize(y, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            s = estimate_noise(small) * 1.4  # 縮半會降低雜訊,補回約 √2
+            self._sigma = s if self._sigma is None else self.smooth * self._sigma + (1 - self.smooth) * s
+        self._frame += 1
         sigma = self._sigma
 
         b1 = self._base(y, 2, (0.04 * 255) ** 2)
@@ -245,3 +250,18 @@ class DetailEnhancer:
         delta = w * (self.fine * d1c + self.medium * d2c) - dn * (d1 - d1c)
         delta = np.clip(delta, -self.max_delta, self.max_delta)
         return np.clip(f + delta[..., None], 0, 255).astype(np.uint8)
+
+
+def stabilization_zoom(corrections: np.ndarray, w: int, h: int, max_zoom: float = 1.08) -> float:
+    """剛好蓋住修正後黑邊所需的放大倍率(取 99 百分位,避免單一極端值放大整支影片)。
+
+    固定放大 5% 會無謂地損失解析度;晃動小的影片只需要放大 1~2%。
+    """
+    if len(corrections) == 0:
+        return 1.0
+    dx = np.percentile(np.abs(corrections[:, 0]), 99) / w
+    dy = np.percentile(np.abs(corrections[:, 1]), 99) / h
+    da = np.percentile(np.abs(corrections[:, 2]), 99)
+    # 平移每邊需要 2×位移比例;旋轉 θ 時角落外露約 θ×(長邊/短邊)。
+    need = 1.0 + 2.0 * max(dx, dy) + da * max(w, h) / min(w, h)
+    return float(np.clip(need, 1.0, max_zoom))

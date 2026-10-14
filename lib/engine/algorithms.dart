@@ -290,6 +290,26 @@ List<Motion> smoothTrajectory(List<Motion> motions, int radius) {
   ];
 }
 
+/// 剛好蓋住修正後黑邊所需的放大倍率(取 99 百分位,避免單一極端值放大整支影片)。
+/// 固定放大 5% 會無謂地損失解析度;晃動小的影片只需要放大 1~2%。
+/// 對應 python_engine/algorithms.py 的 stabilization_zoom。
+double stabilizationZoom(List<Motion> c, int w, int h, {double maxZoom = 1.08}) {
+  if (c.isEmpty) return 1.0;
+  double p99(Iterable<double> v) {
+    final s = v.map((e) => e.abs()).toList()..sort();
+    final pos = 0.99 * (s.length - 1);
+    final lo = pos.floor(), hi = pos.ceil();
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo);
+  }
+
+  final dx = p99(c.map((m) => m.dx)) / w;
+  final dy = p99(c.map((m) => m.dy)) / h;
+  final da = p99(c.map((m) => m.da));
+  // 平移每邊需要 2×位移比例;旋轉 θ 時角落外露約 θ×(長邊/短邊)。
+  final need = 1.0 + 2.0 * math.max(dx, dy) + da * math.max(w, h) / math.min(w, h);
+  return need.clamp(1.0, maxZoom);
+}
+
 /// 套用補償量並以影格中心放大 [zoom] 倍,裁掉黑邊。回傳新的 Mat。
 cv.Mat applyStabilization(cv.Mat frame, Motion c, double zoom) {
   final w = frame.cols, h = frame.rows;
@@ -300,8 +320,9 @@ cv.Mat applyStabilization(cv.Mat frame, Motion c, double zoom) {
     sn, cs, cy - sn * cx - cs * cy + c.dy,
   ]);
   try {
+    // Lanczos 取樣:雙線性在放大時會把細節抹掉約三成,Lanczos 只損失約一成。
     return cv.warpAffine(frame, m, (w, h),
-        flags: cv.INTER_LINEAR, borderMode: cv.BORDER_REPLICATE);
+        flags: cv.INTER_LANCZOS4, borderMode: cv.BORDER_REPLICATE);
   } finally {
     m.dispose();
   }
