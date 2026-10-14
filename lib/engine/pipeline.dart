@@ -447,7 +447,7 @@ Future<void> processVideo(
       onProgress?.call(shaky ? '偵測到晃動,套用防手震' : '畫面穩定,略過防手震', 1.0);
       lastShakeScore = jitter;
       if (shaky) {
-        final smooth = smoothTrajectory(list, options.smoothRadius);
+        final smooth = limitCorrections(smoothTrajectory(list, options.smoothRadius), workW, workH);
         corrections = Float64List.fromList([for (final m in smooth) ...[m.dx, m.dy, m.da]]);
         zoom = options.zoom > 0 ? options.zoom : stabilizationZoom(smooth, workW, workH);
       }

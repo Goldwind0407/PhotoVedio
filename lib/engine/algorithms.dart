@@ -175,29 +175,50 @@ class Dehazer {
         t = s.keep(cv.resize(t, (w, h), interpolation: cv.INTER_LINEAR));
       }
 
-      final f = s.keep(frame.convertTo(cv.MatType.CV_32FC3, alpha: 1 / 255));
-      final aFull = s.keep(cv.Mat.fromScalar(
-          h, w, cv.MatType.CV_32FC3, cv.Scalar(a[0], a[1], a[2], 0)));
-      final tt = s.keep(cv.merge(s.keepVec(cv.VecMat.fromList([t, t, t]))));
-      // J = (I - A) / t + A
-      final j = s.keep(cv.add(
-          s.keep(cv.divide(s.keep(cv.subtract(f, aFull)), tt)), aFull));
-      // convertTo 對 8U 自動飽和,等同 clip(0,255)。
-      final out = s.keep(j.convertTo(cv.MatType.CV_8UC3, alpha: 255 * gain));
-      if (chroma >= 1.0) return s.take(out);
-
-      // 明度取自去霧結果,色度(a、b)大部分取自原片。
-      final lo = s.keep(cv.cvtColor(out, cv.COLOR_BGR2Lab));
-      final li = s.keep(cv.cvtColor(frame, cv.COLOR_BGR2Lab));
-      final mix = s.keep(cv.addWeighted(li, 1 - chroma, lo, chroma, 0));
-      final loCh = s.keepVec(cv.split(lo));
-      final mixCh = s.keepVec(cv.split(mix));
-      final lab = s.keep(
-          cv.merge(s.keepVec(cv.VecMat.fromList([loCh[0], mixCh[1], mixCh[2]]))));
-      return cv.cvtColor(lab, cv.COLOR_Lab2BGR);
+      // 原尺寸的合成全是逐像素運算,分條處理結果與整張相同;
+      // 12MP 照片整張做浮點運算要好幾百 MB,分條後峰值只剩一小部分。
+      final out = cv.Mat.zeros(h, w, cv.MatType.CV_8UC3);
+      final step = math.max(1, _stripPixels ~/ w);
+      for (var y0 = 0; y0 < h; y0 += step) {
+        final rect = cv.Rect(0, y0, w, math.min(step, h - y0));
+        final ss = _Scope();
+        try {
+          final res = _compose(ss, ss.keep(frame.region(rect)), ss.keep(t.region(rect)), a, gain);
+          res.copyTo(ss.keep(out.region(rect)));
+        } finally {
+          ss.dispose();
+        }
+      }
+      return out;
     } finally {
       s.dispose();
     }
+  }
+
+  static const _stripPixels = 1 << 20;
+
+  /// J = (I - A) / t + A,再把色度大部分換回原片。回傳的 Mat 由 [s] 管理。
+  cv.Mat _compose(_Scope s, cv.Mat frame, cv.Mat t, List<double> a, double gain) {
+    final h = frame.rows, w = frame.cols;
+    final f = s.keep(frame.convertTo(cv.MatType.CV_32FC3, alpha: 1 / 255));
+    final aFull = s.keep(cv.Mat.fromScalar(
+        h, w, cv.MatType.CV_32FC3, cv.Scalar(a[0], a[1], a[2], 0)));
+    final tt = s.keep(cv.merge(s.keepVec(cv.VecMat.fromList([t, t, t]))));
+    final j = s.keep(cv.add(
+        s.keep(cv.divide(s.keep(cv.subtract(f, aFull)), tt)), aFull));
+    // convertTo 對 8U 自動飽和,等同 clip(0,255)。
+    final out = s.keep(j.convertTo(cv.MatType.CV_8UC3, alpha: 255 * gain));
+    if (chroma >= 1.0) return out;
+
+    // 明度取自去霧結果,色度(a、b)大部分取自原片。
+    final lo = s.keep(cv.cvtColor(out, cv.COLOR_BGR2Lab));
+    final li = s.keep(cv.cvtColor(frame, cv.COLOR_BGR2Lab));
+    final mix = s.keep(cv.addWeighted(li, 1 - chroma, lo, chroma, 0));
+    final loCh = s.keepVec(cv.split(lo));
+    final mixCh = s.keepVec(cv.split(mix));
+    final lab = s.keep(
+        cv.merge(s.keepVec(cv.VecMat.fromList([loCh[0], mixCh[1], mixCh[2]]))));
+    return s.keep(cv.cvtColor(lab, cv.COLOR_Lab2BGR));
   }
 }
 
@@ -289,6 +310,19 @@ List<Motion> smoothTrajectory(List<Motion> motions, int radius) {
           avg(traj[2], i) - traj[2][i]),
   ];
 }
+
+/// 把每格修正量限制在畫面每邊 [budget] 比例以內,控制防手震需要的裁切放大。
+/// 實測:視窗 15 格、上限 1.5% 時只需放大 3.5%,仍保有約 60% 的抖動降低;
+/// 不設上限則要放大近 9%,細節損失會抵銷畫質增強。超出上限的多半是快速運鏡,本來就不該修。
+/// 對應 python_engine/algorithms.py 的 limit_corrections。
+List<Motion> limitCorrections(List<Motion> c, int w, int h, {double budget = 0.015}) => [
+      for (final m in c)
+        Motion(
+          m.dx.clamp(-budget * w, budget * w),
+          m.dy.clamp(-budget * h, budget * h),
+          m.da.clamp(-budget, budget),
+        ),
+    ];
 
 /// 剛好蓋住修正後黑邊所需的放大倍率(取 99 百分位,避免單一極端值放大整支影片)。
 /// 固定放大 5% 會無謂地損失解析度;晃動小的影片只需要放大 1~2%。

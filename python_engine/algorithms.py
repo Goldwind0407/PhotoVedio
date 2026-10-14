@@ -265,3 +265,39 @@ def stabilization_zoom(corrections: np.ndarray, w: int, h: int, max_zoom: float 
     # 平移每邊需要 2×位移比例;旋轉 θ 時角落外露約 θ×(長邊/短邊)。
     need = 1.0 + 2.0 * max(dx, dy) + da * max(w, h) / min(w, h)
     return float(np.clip(need, 1.0, max_zoom))
+
+
+def limit_corrections(corr: np.ndarray, w: int, h: int, budget: float = 0.015) -> np.ndarray:
+    """把每格修正量限制在畫面每邊 budget 比例以內,控制防手震需要的裁切放大。
+
+    在 test5 實測:視窗 15 格、上限 1.5% 時只需放大 3.5%,仍保有約 60% 的抖動降低;
+    不設上限則要放大近 9%,細節損失會抵銷畫質增強。超出上限的多半是快速運鏡,本來就不該修。
+    """
+    c = corr.copy()
+    c[:, 0] = np.clip(c[:, 0], -budget * w, budget * w)
+    c[:, 1] = np.clip(c[:, 1], -budget * h, budget * h)
+    c[:, 2] = np.clip(c[:, 2], -budget, budget)
+    return c
+
+
+def lock_trajectory(motions: np.ndarray, w: int, h: int, max_zoom: float = 1.25
+                    ) -> tuple[np.ndarray, float, int] | None:
+    """三腳架鎖定:把鏡頭路徑換成一條完全平滑的多項式(0 次 = 固定不動、1 次 = 等速運鏡…),
+    抵銷所有晃動與不規則漂移。在 0~3 次中選需要放大最少的;超過 max_zoom 就回傳 None。
+
+    回傳 (每格補償量, 放大倍率, 多項式次數)。
+    """
+    traj = np.cumsum(motions, axis=0)
+    t = np.arange(len(traj))
+    best = None
+    for deg in range(4):
+        if len(traj) <= deg + 1:
+            break
+        fit = np.stack([np.polyval(np.polyfit(t, traj[:, i], deg), t) for i in range(3)], axis=1)
+        corr = fit - traj
+        zoom = stabilization_zoom(corr, w, h, max_zoom=4.0)
+        if best is None or zoom < best[1] - 0.005:  # 次數越低越穩,除非能明顯少裁
+            best = (corr, zoom, deg)
+    if best is None or best[1] > max_zoom:
+        return None
+    return best

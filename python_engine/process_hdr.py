@@ -15,11 +15,13 @@ import time
 import numpy as np
 
 from algorithms import DetailEnhancer
-from algorithms import apply_stabilization, estimate_motion, smooth_trajectory, stabilization_zoom
+from algorithms import (apply_stabilization, estimate_motion, limit_corrections, lock_trajectory,
+                        smooth_trajectory, stabilization_zoom)
 from roundtrip import FFMPEG, probe
 
 ANALYSIS_LONG_SIDE = 1280
 SHAKE_THRESHOLD = 1.0e-3  # 與 App 相同:高頻抖動 / 畫面長邊
+LOCK = False  # --lock:三腳架鎖定模式(完全無晃動,裁切較多)
 ACC = "accurate_rnd+full_chroma_int+full_chroma_inp"
 
 
@@ -56,6 +58,8 @@ def analyze(src: str, w: int, h: int, matrix: str) -> np.ndarray:
 
 def main() -> int:
     src, dst = sys.argv[1:3]
+    global LOCK
+    LOCK = "--lock" in sys.argv[3:]
     w, h, fps, hdr = probe(src)
     m = "bt2020" if hdr else "bt709"
     t0 = time.time()
@@ -63,9 +67,17 @@ def main() -> int:
     motions = analyze(src, w, h, m)
     score = shake_score(motions, max(w, h))
     shaky = score >= SHAKE_THRESHOLD
-    corr = smooth_trajectory(motions, 15) if shaky else None
-    zoom = stabilization_zoom(corr, w, h) if corr is not None else 1.0
-    print(f"晃動分數 {score:.2e}({'有晃動,套用防手震' if shaky else '穩定,略過防手震'})  放大 {zoom:.3f}  "
+    corr, zoom, mode = None, 1.0, ""
+    if shaky:
+        locked = lock_trajectory(motions, w, h) if LOCK else None
+        if locked is not None:
+            corr, zoom, deg = locked
+            mode = ["鎖定:固定鏡頭", "鎖定:等速運鏡", "鎖定:二次曲線運鏡", "鎖定:三次曲線運鏡"][deg]
+        else:
+            corr = limit_corrections(smooth_trajectory(motions, 15), w, h)
+            zoom = stabilization_zoom(corr, w, h)
+            mode = "平滑"
+    print(f"晃動分數 {score:.2e}({'有晃動,套用防手震 ' + mode if shaky else '穩定,略過防手震'})  放大 {zoom:.3f}  "
           f"分析 {time.time() - t0:.0f}s", flush=True)
 
     codec = (["-vf", f"scale=out_color_matrix={m}:out_range=tv:flags=accurate_rnd+full_chroma_int,format=yuv420p10le",

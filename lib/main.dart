@@ -9,6 +9,7 @@ import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'engine/photo.dart';
 import 'video_page.dart';
 
 void main() => runApp(const EditorApp());
@@ -120,7 +121,24 @@ class _EditorPageState extends State<EditorPage> {
   double _contrast = 1; // 0.5 ~ 1.5
   double _saturation = 1; // 0 ~ 2
   double _sharpen = 0; // 0 ~ 1
+  bool _enhance = false;
+  bool _dehaze = false;
+  double _dehazeStrength = 0.6; // 0 ~ 1
+  Uint8List? _preview; // 除霧/提高畫質的預覽結果(縮小尺寸)
+  bool _processing = false;
+  int _generation = 0; // 用來丟棄過時的預覽結果
+  bool _showOriginal = false; // 長按畫面時顯示原圖
   bool _busy = false;
+
+  /// 預覽在縮小的圖上算,比較快;儲存時才用原尺寸。
+  static const _previewLongSide = 1600;
+
+  PhotoOptions _photoOptions({int maxLongSide = 0}) => PhotoOptions(
+        enhance: _enhance,
+        dehaze: _dehaze,
+        dehazeStrength: _dehazeStrength,
+        maxLongSide: maxLongSide,
+      );
 
   ColorMatrix get _matrix {
     var m = presets[_filter].matrix;
@@ -135,13 +153,45 @@ class _EditorPageState extends State<EditorPage> {
         .showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  void _reset() => setState(() {
-        _filter = 0;
-        _brightness = 0;
-        _contrast = 1;
-        _saturation = 1;
-        _sharpen = 0;
+  void _reset() {
+    setState(() {
+      _filter = 0;
+      _brightness = 0;
+      _contrast = 1;
+      _saturation = 1;
+      _sharpen = 0;
+      _enhance = false;
+      _dehaze = false;
+      _dehazeStrength = 0.6;
+    });
+    _updatePreview();
+  }
+
+  Future<void> _updatePreview() async {
+    final bytes = _bytes;
+    final opts = _photoOptions(maxLongSide: _previewLongSide);
+    final gen = ++_generation;
+    if (bytes == null || !opts.any) {
+      setState(() {
+        _preview = null;
+        _processing = false;
       });
+      return;
+    }
+    setState(() => _processing = true);
+    try {
+      final out = await Isolate.run(() => processPhoto(bytes, opts));
+      if (!mounted || gen != _generation) return;
+      setState(() {
+        _preview = out;
+        _processing = false;
+      });
+    } catch (e) {
+      if (!mounted || gen != _generation) return;
+      setState(() => _processing = false);
+      _toast('處理失敗:$e');
+    }
+  }
 
   Future<void> _pick() async {
     final file = await ImagePicker().pickImage(source: ImageSource.gallery);
@@ -157,7 +207,10 @@ class _EditorPageState extends State<EditorPage> {
     final result = await Navigator.of(context).push<Uint8List>(
       MaterialPageRoute(builder: (_) => CropPage(bytes: bytes)),
     );
-    if (result != null) setState(() => _bytes = result);
+    if (result != null) {
+      setState(() => _bytes = result);
+      _updatePreview();
+    }
   }
 
   Future<void> _save() async {
@@ -167,8 +220,10 @@ class _EditorPageState extends State<EditorPage> {
     try {
       final matrix = _matrix;
       final sharpen = _sharpen;
-      // 在背景 isolate 處理,避免畫面卡住。
-      final out = await Isolate.run(() => _render(bytes, matrix, sharpen));
+      final opts = _photoOptions();
+      // 在背景 isolate 處理,避免畫面卡住。除霧/提高畫質用原尺寸重算。
+      final out = await Isolate.run(() =>
+          _render(opts.any ? processPhoto(bytes, opts) : bytes, matrix, sharpen));
       if (Platform.isAndroid || Platform.isIOS) {
         await Gal.putImageBytes(out, name: 'edit_${_stamp()}');
         _toast('已儲存到相簿');
@@ -232,11 +287,35 @@ class _EditorPageState extends State<EditorPage> {
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
-                      ColorFiltered(
-                        colorFilter: ColorFilter.matrix(_matrix),
-                        child: Image.memory(_bytes!, fit: BoxFit.contain),
+                      GestureDetector(
+                        onLongPressStart: (_) =>
+                            setState(() => _showOriginal = true),
+                        onLongPressEnd: (_) =>
+                            setState(() => _showOriginal = false),
+                        child: ColorFiltered(
+                          colorFilter: ColorFilter.matrix(_matrix),
+                          child: Image.memory(
+                            _showOriginal || _preview == null
+                                ? _bytes!
+                                : _preview!,
+                            fit: BoxFit.contain,
+                            gaplessPlayback: true,
+                          ),
+                        ),
                       ),
                       if (_busy) const CircularProgressIndicator(),
+                      if (_showOriginal)
+                        const Positioned(
+                            top: 8, child: Chip(label: Text('原圖'))),
+                      if (_processing && !_busy)
+                        const Positioned(
+                          top: 8,
+                          right: 8,
+                          child: SizedBox.square(
+                            dimension: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -277,6 +356,36 @@ class _EditorPageState extends State<EditorPage> {
                 ],
               ),
             ),
+            Row(
+              children: [
+                FilterChip(
+                  avatar: const Icon(Icons.auto_awesome, size: 18),
+                  label: const Text('提高畫質'),
+                  selected: _enhance,
+                  onSelected: (v) {
+                    setState(() => _enhance = v);
+                    _updatePreview();
+                  },
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  avatar: const Icon(Icons.blur_off, size: 18),
+                  label: const Text('除霧'),
+                  selected: _dehaze,
+                  onSelected: (v) {
+                    setState(() => _dehaze = v);
+                    _updatePreview();
+                  },
+                ),
+                const Spacer(),
+                Text('長按看原圖',
+                    style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+            if (_dehaze)
+              _slider('強度', _dehazeStrength, 0.1, 1, 0.6,
+                  (v) => setState(() => _dehazeStrength = v),
+                  onChangeEnd: (_) => _updatePreview()),
             _slider('亮度', _brightness, -0.5, 0.5, 0,
                 (v) => setState(() => _brightness = v)),
             _slider('對比', _contrast, 0.5, 1.5, 1,
@@ -294,18 +403,22 @@ class _EditorPageState extends State<EditorPage> {
 
   Widget _slider(String label, double value, double min, double max,
       double neutral, ValueChanged<double> onChanged,
-      {String? note}) {
+      {String? note, ValueChanged<double>? onChangeEnd}) {
     return Row(
       children: [
         SizedBox(width: 40, child: Text(label)),
         Expanded(
           child: GestureDetector(
-            onDoubleTap: () => onChanged(neutral),
+            onDoubleTap: () {
+              onChanged(neutral);
+              onChangeEnd?.call(neutral);
+            },
             child: Slider(
               value: value.clamp(min, max),
               min: min,
               max: max,
               onChanged: onChanged,
+              onChangeEnd: onChangeEnd,
             ),
           ),
         ),
