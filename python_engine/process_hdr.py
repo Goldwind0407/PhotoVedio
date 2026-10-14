@@ -15,8 +15,9 @@ import time
 import numpy as np
 
 from algorithms import DetailEnhancer
-from algorithms import (STABILIZE_LEVELS, apply_stabilization, estimate_motion, lock_trajectory,
-                        smoothing_sigma, stabilization_zoom, stabilize_path)
+from algorithms import (RS_BANDS, STABILIZE_LEVELS, apply_stabilization, estimate_motion_bands,
+                        lock_trajectory, rolling_shutter_offsets, smoothing_sigma, stabilization_zoom,
+                        stabilize_path)
 from roundtrip import FFMPEG, probe
 
 ANALYSIS_LONG_SIDE = 1280
@@ -37,24 +38,25 @@ def shake_score(motions: np.ndarray, long_side: int) -> float:
     return float(np.sqrt(((traj - sm) ** 2).sum(axis=1)).mean() / long_side)
 
 
-def analyze(src: str, w: int, h: int, matrix: str) -> np.ndarray:
+def analyze(src: str, w: int, h: int, matrix: str) -> tuple[np.ndarray, np.ndarray]:
     s = min(1.0, ANALYSIS_LONG_SIDE / max(w, h))
     aw, ah = max(2, round(w * s) // 2 * 2), max(2, round(h * s) // 2 * 2)
     dec = subprocess.Popen([FFMPEG, "-v", "error", "-i", src, "-an",
                             "-vf", f"scale={aw}:{ah},format=gray", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
                            stdout=subprocess.PIPE)
-    size, prev, out = aw * ah, None, [(0.0, 0.0, 0.0)]
+    size, prev, out, res = aw * ah, None, [(0.0, 0.0, 0.0)], [np.zeros((RS_BANDS, 2))]
     while True:
         buf = dec.stdout.read(size)
         if len(buf) < size:
             break
         g = np.frombuffer(buf, np.uint8).reshape(ah, aw)
         if prev is not None:
-            dx, dy, da = estimate_motion(prev, g)
+            dx, dy, da, r = estimate_motion_bands(prev, g)
             out.append((dx * w / aw, dy * h / ah, da))
+            res.append(r * [w / aw, h / ah])
         prev = g
     dec.wait()
-    return np.array(out)
+    return np.array(out), np.array(res)
 
 
 def main() -> int:
@@ -66,7 +68,8 @@ def main() -> int:
     m = "bt2020" if hdr else "bt709"
     t0 = time.time()
 
-    motions = analyze(src, w, h, m)
+    motions, residuals = analyze(src, w, h, m)
+    rs = rolling_shutter_offsets(residuals, fps / 2)  # 果凍效應修正
     score = shake_score(motions, max(w, h))
     shaky = score >= SHAKE_THRESHOLD
     corr, zoom, mode = None, 1.0, ""
@@ -105,7 +108,7 @@ def main() -> int:
             break
         f = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
         if corr is not None and i < len(corr):
-            f = apply_stabilization(f, corr[i], zoom)
+            f = apply_stabilization(f, corr[i], zoom, rs[i])
         f = enhancer(f)
         enc.stdin.write(np.ascontiguousarray(f).tobytes())
         i += 1

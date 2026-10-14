@@ -122,43 +122,65 @@ double stabilizationZoom(List<Motion> c, int w, int h, {double maxZoom = 1.08}) 
   return need.clamp(1.0, maxZoom);
 }
 
+/// 解線性方程組 a x = b(高斯消去、部分選主元)。a、b 會被改寫。
+Float64List _solve(List<Float64List> a, Float64List b) {
+  final m = b.length;
+  for (var col = 0; col < m; col++) {
+    var piv = col;
+    for (var r = col + 1; r < m; r++) {
+      if (a[r][col].abs() > a[piv][col].abs()) piv = r;
+    }
+    if (piv != col) {
+      final t = a[col];
+      a[col] = a[piv];
+      a[piv] = t;
+      final tb = b[col];
+      b[col] = b[piv];
+      b[piv] = tb;
+    }
+    final d = a[col][col];
+    if (d == 0) continue;
+    for (var r = col + 1; r < m; r++) {
+      final f = a[r][col] / d;
+      if (f == 0) continue;
+      for (var c = col; c < m; c++) {
+        a[r][c] -= f * a[col][c];
+      }
+      b[r] -= f * b[col];
+    }
+  }
+  final x = Float64List(m);
+  for (var r = m - 1; r >= 0; r--) {
+    var acc = b[r];
+    for (var c = r + 1; c < m; c++) {
+      acc -= a[r][c] * x[c];
+    }
+    x[r] = a[r][r] == 0 ? 0 : acc / a[r][r];
+  }
+  return x;
+}
+
 /// 最小平方多項式擬合,回傳擬合值。t 先正規化到 [-1, 1],避免高次項數值不穩。
 Float64List _polyFit(Float64List v, int deg) {
   final n = v.length, m = deg + 1;
   final ts = Float64List.fromList([for (var i = 0; i < n; i++) n == 1 ? 0.0 : 2.0 * i / (n - 1) - 1]);
   // 正規方程 A^T A c = A^T v
-  final a = List.generate(m, (_) => Float64List(m + 1));
+  final ata = List.generate(m, (_) => Float64List(m));
+  final atb = Float64List(m);
+  final pw = Float64List(m);
   for (var i = 0; i < n; i++) {
-    final pw = Float64List(m);
     pw[0] = 1;
     for (var k = 1; k < m; k++) {
       pw[k] = pw[k - 1] * ts[i];
     }
     for (var r = 0; r < m; r++) {
       for (var c = 0; c < m; c++) {
-        a[r][c] += pw[r] * pw[c];
+        ata[r][c] += pw[r] * pw[c];
       }
-      a[r][m] += pw[r] * v[i];
+      atb[r] += pw[r] * v[i];
     }
   }
-  // 高斯消去(部分選主元)
-  for (var col = 0; col < m; col++) {
-    var piv = col;
-    for (var r = col + 1; r < m; r++) {
-      if (a[r][col].abs() > a[piv][col].abs()) piv = r;
-    }
-    final tmp = a[col];
-    a[col] = a[piv];
-    a[piv] = tmp;
-    for (var r = 0; r < m; r++) {
-      if (r == col || a[col][col] == 0) continue;
-      final f = a[r][col] / a[col][col];
-      for (var c = col; c <= m; c++) {
-        a[r][c] -= f * a[col][c];
-      }
-    }
-  }
-  final coef = [for (var r = 0; r < m; r++) a[r][r] == 0 ? 0.0 : a[r][m] / a[r][r]];
+  final coef = _solve(ata, atb);
   return Float64List.fromList([
     for (var i = 0; i < n; i++)
       () {
@@ -192,4 +214,103 @@ Float64List _polyFit(Float64List v, int deg) {
   }
   if (best == null || best.$2 > maxZoom) return null;
   return best;
+}
+
+// --------------------------------------------------------------- 果凍效應(捲簾快門)
+
+/// 果凍效應修正:畫面切成幾條水平帶分別估計位移。
+const rsBands = 8;
+
+/// 聯合最小平方:位移 = 平移 + 繞畫面中心的小角度旋轉 + 各條帶的平移(總和為 0)。
+///
+/// 手機感光元件逐行讀出,同一格的上下兩端相差約一格的時間,手震時各條帶的位移不同。
+/// 旋轉與果凍的水平錯位在 x 方向上很像(都隨列線性變化),分開估計時果凍會被誤當成旋轉;
+/// 旋轉同時會產生隨行變化的垂直位移,放進同一個模型才分得開。
+/// 條帶間加平滑項(果凍扭曲沿畫面高度是連續的),特徵點少的條帶也有合理的值。
+/// 用 Huber 權重重複解 3 次,降低少數錯誤配對的影響。
+///
+/// [p0]、[p1] 為前後兩格對應點,交錯排列 [x0, y0, x1, y1, …]。
+/// 回傳(繞中心的運動, 各條帶殘差 [bx0, by0, bx1, by1, …])。
+/// 對應 python_engine/algorithms.py 的 _fit_bands。
+(Motion, Float64List) fitBands(Float64List p0, Float64List p1, int w, int h, {int bands = rsBands}) {
+  final n = p0.length ~/ 2;
+  final k = 3 + 2 * bands;
+  final cx = w / 2, cy = h / 2;
+  final band = Int32List(n);
+  for (var j = 0; j < n; j++) {
+    band[j] = (p0[2 * j + 1] / h * bands).floor().clamp(0, bands - 1);
+  }
+  final wx = Float64List(n)..fillRange(0, n, 1.0);
+  final wy = Float64List(n)..fillRange(0, n, 1.0);
+  final sumW = 10.0 * math.sqrt(n), diffW = 0.3 * math.sqrt(n / bands);
+  var u = Float64List(k);
+  for (var it = 0; it < 3; it++) {
+    final ata = List.generate(k, (_) => Float64List(k));
+    final atb = Float64List(k);
+    void addRow(List<int> idx, List<double> val, double rhs, double wt) {
+      final w2 = wt * wt;
+      for (var a = 0; a < idx.length; a++) {
+        for (var b = 0; b < idx.length; b++) {
+          ata[idx[a]][idx[b]] += w2 * val[a] * val[b];
+        }
+        atb[idx[a]] += w2 * val[a] * rhs;
+      }
+    }
+
+    for (var j = 0; j < n; j++) {
+      final x = p0[2 * j], y = p0[2 * j + 1];
+      // dx = tx - θ(y-cy) + bx[band]、dy = ty + θ(x-cx) + by[band]
+      addRow([0, 2, 3 + band[j]], [1, -(y - cy), 1], p1[2 * j] - x, wx[j]);
+      addRow([1, 2, 3 + bands + band[j]], [1, x - cx, 1], p1[2 * j + 1] - y, wy[j]);
+    }
+    // 約束列:條帶總和為 0(權重大),條帶二次差分為小(平滑)
+    for (final off in [3, 3 + bands]) {
+      addRow([for (var i = 0; i < bands; i++) off + i], List.filled(bands, sumW), 0, 1);
+      for (var i = 1; i < bands - 1; i++) {
+        addRow([off + i - 1, off + i, off + i + 1], [diffW, -2 * diffW, diffW], 0, 1);
+      }
+    }
+    for (var i = 0; i < k; i++) {
+      ata[i][i] += 1e-9;
+    }
+    u = _solve(ata, atb);
+    for (var j = 0; j < n; j++) {
+      final x = p0[2 * j], y = p0[2 * j + 1];
+      final rx = (u[0] - u[2] * (y - cy) + u[3 + band[j]] - (p1[2 * j] - x)).abs();
+      final ry = (u[1] + u[2] * (x - cx) + u[3 + bands + band[j]] - (p1[2 * j + 1] - y)).abs();
+      wx[j] = math.sqrt(math.min(1.0, 1.0 / math.max(rx, 1e-9))); // Huber,門檻 1px
+      wy[j] = math.sqrt(math.min(1.0, 1.0 / math.max(ry, 1e-9)));
+    }
+  }
+  final res = Float64List(2 * bands);
+  for (var i = 0; i < bands; i++) {
+    res[2 * i] = u[3 + i];
+    res[2 * i + 1] = u[3 + bands + i];
+  }
+  return (Motion(u[0], u[1], u[2]), res);
+}
+
+/// 由每格各條帶的殘差位移算出每格各條帶相對整體的偏移(格式同 [fitBands] 的殘差)。
+///
+/// 累加殘差得到各條帶的相對位置,再減去約 1 秒的移動平均(高通):只留下快速的抖動與扭曲,
+/// 去掉估計誤差累積的漂移,以及等速運鏡造成的固定傾斜(那種傾斜看起來很自然,不修)。
+/// 修正時把各條帶往反方向移回去。對應 python_engine/algorithms.py 的 rolling_shutter_offsets。
+List<Float64List> rollingShutterOffsets(List<Float64List> residuals, double sigma) {
+  final n = residuals.length;
+  if (n < 3) return [for (final r in residuals) Float64List(r.length)];
+  final cols = residuals[0].length;
+  final out = List.generate(n, (_) => Float64List(cols));
+  final pos = Float64List(n);
+  for (var c = 0; c < cols; c++) {
+    var acc = 0.0;
+    for (var i = 0; i < n; i++) {
+      acc += residuals[i][c];
+      pos[i] = acc;
+    }
+    final sm = _gaussSmooth(pos, sigma);
+    for (var i = 0; i < n; i++) {
+      out[i][c] = pos[i] - sm[i];
+    }
+  }
+  return out;
 }

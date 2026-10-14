@@ -245,7 +245,7 @@ class _VideoPageState extends State<VideoPage> {
               dense: true,
               title: const Text('防手震'),
               subtitle: Text(switch (_stabilizeLevel) {
-                StabilizeLevel.standard => '畫面裁切約 5~10%',
+                StabilizeLevel.standard => '含果凍效應修正,畫面裁切約 5~10%',
                 StabilizeLevel.strong => '適合走路拍攝,裁切約 10~16%',
                 StabilizeLevel.lock => '像架在腳架上,完全不晃;裁切最多',
               }),

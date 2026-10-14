@@ -276,6 +276,8 @@ bool _readFully(RandomAccessFile f, Uint8List buf) {
 
 // ---- 階段 1:晃動分析 ----
 
+const _motionStride = 3 + 2 * rsBands;
+
 class _AnalysisJob {
   const _AnalysisJob(this.pipe, this.w, this.h, this.frames);
   final String pipe;
@@ -288,12 +290,15 @@ void _analysisEntry((Object, SendPort) args) {
     final f = File(job.pipe).openSync();
     var prev = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC1);
     var cur = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC1);
-    final out = <double>[0, 0, 0]; // 第一格沒有前一格
+    // 每格 3 + 2×rsBands 個值:dx, dy, da, 各條帶果凍殘差;第一格沒有前一格,全為 0。
+    final out = List<double>.filled(_motionStride, 0, growable: true);
     if (_readFully(f, prev.data)) {
       for (var i = 1; i < job.frames; i++) {
         if (!_readFully(f, cur.data)) break;
-        final m = estimateMotion(prev, cur);
-        out.addAll([m.dx, m.dy, m.da]);
+        final (m, res) = estimateMotionBands(prev, cur);
+        out
+          ..addAll([m.dx, m.dy, m.da])
+          ..addAll(res);
         (prev, cur) = (cur, prev);
         if (i % 10 == 0) port.send(_Progress('分析晃動', i / job.frames));
       }
@@ -320,12 +325,14 @@ class _RenderJob {
     required this.frames,
     required this.options,
     required this.corrections,
+    required this.rollingShutter,
     required this.zoom,
   });
   final String inPipe, outPipe;
   final int w, h, outW, outH, frames;
   final EngineOptions options;
   final Float64List? corrections; // 每格 3 個值:dx, dy, da
+  final Float64List? rollingShutter; // 每格 2×rsBands 個值:各條帶的果凍偏移
   final double zoom; // 防手震放大倍率
 }
 
@@ -345,6 +352,8 @@ void _renderEntry((Object, SendPort) args) {
     dehazer = o.dehaze ? Dehazer(strength: o.dehazeStrength, chroma: o.dehazeChroma) : null;
     final frame = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC3);
     final c = job.corrections;
+    final rsAll = job.rollingShutter;
+    const rsn = 2 * rsBands;
 
     for (var i = 0; i < job.frames; i++) {
       if (!_readFully(fin, frame.data)) break;
@@ -355,7 +364,11 @@ void _renderEntry((Object, SendPort) args) {
       }
 
       if (c != null && 3 * i + 2 < c.length) {
-        step(applyStabilization(cur, Motion(c[3 * i], c[3 * i + 1], c[3 * i + 2]), job.zoom));
+        final rs = rsAll != null && rsn * (i + 1) <= rsAll.length
+            ? Float64List.sublistView(rsAll, rsn * i, rsn * (i + 1))
+            : null;
+        step(applyStabilization(cur, Motion(c[3 * i], c[3 * i + 1], c[3 * i + 2]), job.zoom,
+            rs: rs));
       }
       // 色調錨定的參照:防手震之後、除霧與畫質之前的影格(位置對得上,亮度色彩是原片的)。
       final ref = anchor != null ? cur.clone() : null;
@@ -414,7 +427,7 @@ Future<VideoReport> processVideo(
   }
 
   try {
-    Float64List? corrections;
+    Float64List? corrections, rollingShutter;
     var zoom = 1.0;
     var report = const VideoReport();
 
@@ -438,15 +451,26 @@ Future<VideoReport> processVideo(
         progress,
       ).whenComplete(() => finished = true);
       final code = await decode;
-      if (!ReturnCode.isSuccess(code) && motions.length < 6) {
+      if (!ReturnCode.isSuccess(code) && motions.length < 2 * _motionStride) {
         throw Exception('解碼失敗:$_lastFfmpegError');
       }
       // 位移是縮小圖上的像素,放大回原解析度;旋轉角與尺度無關。
       final sx = workW / aw, sy = workH / ah;
-      final n = motions.length ~/ 3;
-      final list = [
+      final n = motions.length ~/ _motionStride;
+      Motion motionAt(int i) {
+        final o = i * _motionStride;
+        return Motion(motions[o] * sx, motions[o + 1] * sy, motions[o + 2]);
+      }
+
+      final list = [for (var i = 0; i < n; i++) motionAt(i)];
+      final residuals = [
         for (var i = 0; i < n; i++)
-          Motion(motions[3 * i] * sx, motions[3 * i + 1] * sy, motions[3 * i + 2]),
+          Float64List.fromList([
+            for (var b = 0; b < rsBands; b++) ...[
+              motions[i * _motionStride + 3 + 2 * b] * sx,
+              motions[i * _motionStride + 4 + 2 * b] * sy,
+            ],
+          ]),
       ];
       // 自動判斷:不晃的影片不做修正(裁切放大與重新取樣本身會損失畫質)。
       final jitter = shakeScore(list, math.max(workW, workH));
@@ -475,6 +499,9 @@ Future<VideoReport> processVideo(
         }
         if (options.zoom > 0) zoom = options.zoom;
         corrections = Float64List.fromList([for (final m in smooth) ...[m.dx, m.dy, m.da]]);
+        // 果凍效應修正:高通的時間尺度約半秒(sigma = fps/2 格)。
+        rollingShutter = Float64List.fromList(
+            [for (final r in rollingShutterOffsets(residuals, info.fps / 2)) ...r]);
         report = VideoReport(shakeScore: jitter, stabilized: true, zoom: zoom, locked: locked);
       }
     }
@@ -535,6 +562,7 @@ Future<VideoReport> processVideo(
         frames: frames,
         options: options,
         corrections: corrections,
+        rollingShutter: rollingShutter,
         zoom: zoom,
       ),
       progress,

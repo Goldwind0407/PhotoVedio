@@ -11,8 +11,9 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from algorithms import (STABILIZE_LEVELS, Dehazer, DetailEnhancer, ToneAnchor, apply_stabilization,
-                        estimate_motion, smoothing_sigma, stabilization_zoom, stabilize_path)
+from algorithms import (RS_BANDS, STABILIZE_LEVELS, Dehazer, DetailEnhancer, ToneAnchor,
+                        apply_stabilization, estimate_motion_bands, rolling_shutter_offsets,
+                        smoothing_sigma, stabilization_zoom, stabilize_path)
 
 
 @dataclass
@@ -42,7 +43,8 @@ def _analysis_gray(frame: np.ndarray) -> tuple[np.ndarray, float]:
     return gray, scale
 
 
-def _analyze_motion(path: str, report: Progress) -> np.ndarray:
+def _analyze_motion(path: str, report: Progress) -> tuple[np.ndarray, np.ndarray]:
+    """回傳 (每格運動 (n, 3), 每格各條帶的果凍殘差 (n, bands, 2)),都已換算回原解析度。"""
     cap = cv2.VideoCapture(path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
     ok, prev = cap.read()
@@ -50,28 +52,30 @@ def _analyze_motion(path: str, report: Progress) -> np.ndarray:
         raise RuntimeError("無法讀取影片")
     prev_gray, scale = _analysis_gray(prev)
     motions = [(0.0, 0.0, 0.0)]  # 第一格沒有前一格
+    residuals = [np.zeros((RS_BANDS, 2))]
     i = 1
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         gray, _ = _analysis_gray(frame)
-        dx, dy, da = estimate_motion(prev_gray, gray)
+        dx, dy, da, res = estimate_motion_bands(prev_gray, gray)
         # 位移是縮小圖上的像素,放大回原解析度;旋轉角與尺度無關。
         motions.append((dx / scale, dy / scale, da))
+        residuals.append(res / scale)
         prev_gray = gray
         i += 1
         if i % 10 == 0:
             report("分析晃動", min(i / total, 1.0))
     cap.release()
-    return np.array(motions, dtype=np.float64)
+    return np.array(motions, dtype=np.float64), np.array(residuals)
 
 
 def process_video(src: str, dst: str, opt: Options,
                   report: Progress = lambda stage, p: None) -> None:
     corrections = None
     if opt.stabilize:
-        motions = _analyze_motion(src, report)
+        motions, residuals = _analyze_motion(src, report)
 
     cap = cv2.VideoCapture(src)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -84,6 +88,7 @@ def process_video(src: str, dst: str, opt: Options,
         budget, rot_budget, max_zoom = STABILIZE_LEVELS[opt.stabilize_level]
         corrections = stabilize_path(motions, w, h, budget, rot_budget, smoothing_sigma(fps))
         zoom = zoom or stabilization_zoom(corrections, w, h, max_zoom=max_zoom)
+        rs = rolling_shutter_offsets(residuals, fps / 2)
 
     have_ffmpeg = shutil.which("ffmpeg") is not None
     tmp_video = Path(tempfile.mkdtemp()) / "video_only.mp4" if have_ffmpeg else Path(dst)
@@ -101,7 +106,7 @@ def process_video(src: str, dst: str, opt: Options,
         if not ok:
             break
         if corrections is not None and i < len(corrections):
-            frame = apply_stabilization(frame, corrections[i], zoom)
+            frame = apply_stabilization(frame, corrections[i], zoom, rs[i])
         ref = frame if anchor else None
         if dehazer:
             frame = dehazer(frame)

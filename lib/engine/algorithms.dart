@@ -228,12 +228,14 @@ class Dehazer {
 
 // --------------------------------------------------------------- 防手震
 
-/// 兩張相鄰灰階影格間的位移與旋轉角(特徵點光流 + RANSAC 穩健仿射)。
-Motion estimateMotion(cv.Mat prevGray, cv.Mat gray) {
-  final corners = cv.goodFeaturesToTrack(prevGray, 300, 0.01, 20, blockSize: 3);
+/// 兩張相鄰灰階影格間的運動(繞畫面中心)與各條帶的果凍殘差(見 [fitBands])。
+/// 對應 python_engine/algorithms.py 的 estimate_motion_bands。
+(Motion, Float64List) estimateMotionBands(cv.Mat prevGray, cv.Mat gray) {
+  final zero = (Motion.zero, Float64List(2 * rsBands));
+  final corners = cv.goodFeaturesToTrack(prevGray, 400, 0.01, 16, blockSize: 3);
   if (corners.length < 6) {
     corners.dispose();
-    return Motion.zero;
+    return zero;
   }
   final (next, status, err) =
       cv.calcOpticalFlowPyrLK(prevGray, gray, corners, cv.VecPoint2f());
@@ -244,23 +246,32 @@ Motion estimateMotion(cv.Mat prevGray, cv.Mat gray) {
       to.add(next[i]);
     }
   }
-  Motion result = Motion.zero;
+  var result = zero;
   if (from.length >= 6) {
     final f = cv.VecPoint2f.fromList(from);
     final t = cv.VecPoint2f.fromList(to);
+    // 部分相似變換 + RANSAC,只用來排除移動物體;真正的運動用 fitBands 的聯合模型解。
     final (m, inliers) = cv.estimateAffinePartial2D(f, t,
         method: cv.RANSAC, ransacReprojThreshold: 3.0);
     if (!m.isEmpty) {
-      // m 是繞左上角原點的旋轉 + 平移;防手震是繞畫面中心旋轉,要換算成繞中心的平移,
-      // 否則每格的旋轉會被誤算成「中心 × 角度」的平移(720p 轉 0.2° 就差 2px),反而加入抖動。
-      final a = math.atan2(m.atF64(1, i1: 0), m.atF64(0, i1: 0));
-      final cx = prevGray.cols / 2, cy = prevGray.rows / 2;
-      final c = math.cos(a), s = math.sin(a);
-      result = Motion(
-        m.atF64(0, i1: 2) - (cx - (c * cx - s * cy)),
-        m.atF64(1, i1: 2) - (cy - (s * cx + c * cy)),
-        a,
-      );
+      final a00 = m.atF64(0, i1: 0), a01 = m.atF64(0, i1: 1), a02 = m.atF64(0, i1: 2);
+      final a10 = m.atF64(1, i1: 0), a11 = m.atF64(1, i1: 1), a12 = m.atF64(1, i1: 2);
+      final inl = inliers.isEmpty ? null : inliers.data;
+      final p0 = <double>[], p1 = <double>[];
+      for (var i = 0; i < from.length; i++) {
+        final x = from[i].x, y = from[i].y;
+        // 果凍位移可能超過 RANSAC 的 3px 門檻,殘差在 12px 內的點也加回來。
+        final ex = to[i].x - (a00 * x + a01 * y + a02);
+        final ey = to[i].y - (a10 * x + a11 * y + a12);
+        if ((inl != null && inl[i] == 1) || ex * ex + ey * ey < 144) {
+          p0..add(x)..add(y);
+          p1..add(to[i].x)..add(to[i].y);
+        }
+      }
+      if (p0.length >= 12) {
+        result = fitBands(Float64List.fromList(p0), Float64List.fromList(p1),
+            prevGray.cols, prevGray.rows);
+      }
     }
     m.dispose();
     inliers.dispose();
@@ -275,21 +286,52 @@ Motion estimateMotion(cv.Mat prevGray, cv.Mat gray) {
 }
 
 /// 套用補償量並以影格中心放大 [zoom] 倍,裁掉黑邊。回傳新的 Mat。
-cv.Mat applyStabilization(cv.Mat frame, Motion c, double zoom) {
+///
+/// [rs] 為各條帶的果凍偏移(見 [rollingShutterOffsets]):每 [strip] 列各自多平移 -偏移,
+/// 偏移在條帶中心之間線性內插,條帶交界不會有斷層。
+/// 對應 python_engine/algorithms.py 的 apply_stabilization。
+cv.Mat applyStabilization(cv.Mat frame, Motion c, double zoom, {Float64List? rs, int strip = 16}) {
   final w = frame.cols, h = frame.rows;
   final cs = math.cos(c.da) * zoom, sn = math.sin(c.da) * zoom;
   final cx = w / 2, cy = h / 2;
-  final m = cv.Mat.fromList(2, 3, cv.MatType.CV_64FC1, [
-    cs, -sn, cx - cs * cx + sn * cy + c.dx, //
-    sn, cs, cy - sn * cx - cs * cy + c.dy,
-  ]);
-  try {
-    // Lanczos 取樣:雙線性在放大時會把細節抹掉約三成,Lanczos 只損失約一成。
-    return cv.warpAffine(frame, m, (w, h),
-        flags: cv.INTER_LANCZOS4, borderMode: cv.BORDER_REPLICATE);
-  } finally {
-    m.dispose();
+  final tx = cx - cs * cx + sn * cy + c.dx, ty = cy - sn * cx - cs * cy + c.dy;
+  cv.Mat warp(double ox, double oy, int y0, int rows) {
+    final m = cv.Mat.fromList(2, 3, cv.MatType.CV_64FC1, [
+      cs, -sn, tx - ox, //
+      sn, cs, ty - oy - y0,
+    ]);
+    try {
+      // Lanczos 取樣:雙線性在放大時會把細節抹掉約三成,Lanczos 只損失約一成。
+      return cv.warpAffine(frame, m, (w, rows),
+          flags: cv.INTER_LANCZOS4, borderMode: cv.BORDER_REPLICATE);
+    } finally {
+      m.dispose();
+    }
   }
+
+  if (rs == null || rs.every((v) => v == 0)) return warp(0, 0, 0, h);
+  final bands = rs.length ~/ 2;
+  double interp(double y, int axis) {
+    // 條帶中心 (i + 0.5) * h / bands 之間線性內插,兩端外持平(同 np.interp)。
+    final pos = y / h * bands - 0.5;
+    if (pos <= 0) return rs[axis];
+    if (pos >= bands - 1) return rs[2 * (bands - 1) + axis];
+    final i = pos.floor(), f = pos - i;
+    return rs[2 * i + axis] * (1 - f) + rs[2 * (i + 1) + axis] * f;
+  }
+
+  final out = cv.Mat.zeros(h, w, frame.type);
+  for (var y0 = 0; y0 < h; y0 += strip) {
+    final rows = math.min(strip, h - y0);
+    // 輸出列對應的原影格列(忽略微小旋轉):果凍偏移是按原影格的列量測的。
+    final yc = cy + (y0 + rows / 2 - cy - c.dy) / zoom;
+    final part = warp(interp(yc, 0), interp(yc, 1), y0, rows);
+    final dst = out.region(cv.Rect(0, y0, w, rows));
+    part.copyTo(dst);
+    dst.dispose();
+    part.dispose();
+  }
+  return out;
 }
 
 // --------------------------------------------------------------- 色調錨定

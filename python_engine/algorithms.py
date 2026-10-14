@@ -103,29 +103,87 @@ class Dehazer:
 
 
 # --------------------------------------------------------------- 防手震
-def estimate_motion(prev_gray: np.ndarray, gray: np.ndarray) -> tuple[float, float, float]:
-    """兩張相鄰影格間的 (dx, dy, 旋轉角),用特徵點光流 + 穩健仿射估計。"""
-    pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=300, qualityLevel=0.01,
-                                  minDistance=20, blockSize=3)
+RS_BANDS = 8  # 果凍效應修正:畫面切成幾條水平帶分別估計位移
+
+
+def estimate_motion_bands(prev_gray: np.ndarray, gray: np.ndarray, bands: int = RS_BANDS
+                          ) -> tuple[float, float, float, np.ndarray]:
+    """兩張相鄰影格間的 (dx, dy, 旋轉角) 與每條水平帶的殘差位移 (bands, 2)。
+
+    整體運動用特徵點光流 + RANSAC 相似變換;殘差 = 各特徵點實際位移 - 整體運動預測的位移,
+    每條帶取中位數。手機感光元件逐行讀出,同一格的上下兩端相差約一格的時間,
+    手震時各條帶的位移不同(果凍效應),殘差就是它的量測值。
+    """
+    zero = (0.0, 0.0, 0.0, np.zeros((bands, 2)))
+    pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=400, qualityLevel=0.01,
+                                  minDistance=16, blockSize=3)
     if pts is None:
-        return 0.0, 0.0, 0.0
+        return zero
     nxt, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, pts, None)
     ok = status.ravel() == 1
     if ok.sum() < 6:
-        return 0.0, 0.0, 0.0
+        return zero
+    p0, p1 = pts[ok].reshape(-1, 2), nxt[ok].reshape(-1, 2)
     # 部分相似變換(平移+旋轉+等比縮放),RANSAC 排除移動物體上的點。
-    m, _ = cv2.estimateAffinePartial2D(pts[ok], nxt[ok], method=cv2.RANSAC,
-                                       ransacReprojThreshold=3.0)
+    m, inl = cv2.estimateAffinePartial2D(p0, p1, method=cv2.RANSAC, ransacReprojThreshold=3.0)
     if m is None:
-        return 0.0, 0.0, 0.0
-    # m 是繞左上角原點的旋轉 + 平移;防手震是繞畫面中心旋轉,要換算成繞中心的平移,
-    # 否則每格的旋轉會被誤算成「中心 × 角度」的平移(720p 轉 0.2° 就差 2px),反而加入抖動。
-    a = float(np.arctan2(m[1, 0], m[0, 0]))
-    cx, cy = prev_gray.shape[1] / 2, prev_gray.shape[0] / 2
-    c, s = np.cos(a), np.sin(a)
-    dx = float(m[0, 2]) - (cx - (c * cx - s * cy))
-    dy = float(m[1, 2]) - (cy - (s * cx + c * cy))
-    return dx, dy, a
+        return zero
+    keep = inl.ravel() == 1 if inl is not None else np.ones(len(p0), bool)
+    # RANSAC 只用來排除移動物體;真正的運動用下面的聯合模型解。果凍位移可能超過 3px,
+    # 所以再把殘差在 12px 內的點加回來。
+    pred = p0 @ m[:, :2].T + m[:, 2]
+    keep |= np.hypot(*(p1 - pred).T) < 12.0
+    p0, p1 = p0[keep], p1[keep]
+    if len(p0) < 6:
+        return zero
+    return _fit_bands(p0, p1, prev_gray.shape[1], prev_gray.shape[0], bands)
+
+
+def _fit_bands(p0: np.ndarray, p1: np.ndarray, w: int, h: int, bands: int
+               ) -> tuple[float, float, float, np.ndarray]:
+    """聯合最小平方:位移 = 平移 + 繞畫面中心的小角度旋轉 + 各條帶的平移(總和為 0)。
+
+    旋轉與果凍的水平錯位在 x 方向上很像(都隨列線性變化),分開估計時果凍會被誤當成旋轉;
+    旋轉同時會產生隨行變化的垂直位移,放進同一個模型才分得開。
+    條帶間加平滑項(果凍扭曲沿畫面高度是連續的),特徵點少的條帶也有合理的值。
+    用 Huber 權重重複解 3 次,降低少數錯誤配對的影響。
+    """
+    n = len(p0)
+    cx, cy = w / 2, h / 2
+    d = p1 - p0
+    band = np.minimum((p0[:, 1] / h * bands).astype(int), bands - 1)
+    k = 3 + 2 * bands
+    # 每個點兩列方程:dx = tx - θ(y-cy) + bx[band]、dy = ty + θ(x-cx) + by[band]
+    a = np.zeros((2 * n, k))
+    a[0::2, 0] = 1
+    a[1::2, 1] = 1
+    a[0::2, 2] = -(p0[:, 1] - cy)
+    a[1::2, 2] = p0[:, 0] - cx
+    a[np.arange(0, 2 * n, 2), 3 + band] = 1
+    a[np.arange(1, 2 * n, 2), 3 + bands + band] = 1
+    rhs = d.reshape(-1)
+    # 約束列:條帶總和為 0(權重大),條帶二次差分為小(平滑)
+    cons, crhs = [], []
+    for off in (3, 3 + bands):
+        row = np.zeros(k); row[off:off + bands] = 1
+        cons.append(row * 10.0 * np.sqrt(n)); crhs.append(0.0)
+        for i in range(1, bands - 1):
+            row = np.zeros(k); row[off + i - 1], row[off + i], row[off + i + 1] = 1, -2, 1
+            cons.append(row * 0.3 * np.sqrt(n / bands)); crhs.append(0.0)
+    cons, crhs = np.array(cons), np.array(crhs)
+    wts = np.ones(2 * n)
+    for _ in range(3):
+        aw = np.vstack([a * wts[:, None], cons])
+        bw = np.concatenate([rhs * wts, crhs])
+        u = np.linalg.solve(aw.T @ aw + 1e-9 * np.eye(k), aw.T @ bw)
+        r = np.abs(a @ u - rhs)
+        wts = np.sqrt(np.minimum(1.0, 1.0 / np.maximum(r, 1e-9)))  # Huber,門檻 1px
+    return float(u[0]), float(u[1]), float(u[2]), np.stack([u[3:3 + bands], u[3 + bands:]], 1)
+
+
+def estimate_motion(prev_gray: np.ndarray, gray: np.ndarray) -> tuple[float, float, float]:
+    """兩張相鄰影格間的 (dx, dy, 旋轉角)。"""
+    return estimate_motion_bands(prev_gray, gray)[:3]
 
 
 def _gauss_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
@@ -170,17 +228,50 @@ def stabilize_path(motions: np.ndarray, w: int, h: int, budget: float = 0.03,
     return np.clip(p, traj - b, traj + b) - traj
 
 
-def apply_stabilization(frame: np.ndarray, correction: np.ndarray, zoom: float) -> np.ndarray:
-    """套用補償量並放大 zoom 倍以裁掉黑邊(以影格中心為軸)。"""
+def rolling_shutter_offsets(residuals: np.ndarray, sigma: float) -> np.ndarray:
+    """由每格每條帶的殘差位移 (n, bands, 2) 算出每格每條帶相對整體的偏移 (n, bands, 2)。
+
+    累加殘差得到各條帶的相對位置,再減去約 1 秒的移動平均(高通):只留下快速的抖動與扭曲,
+    去掉估計誤差累積的漂移,以及等速運鏡造成的固定傾斜(那種傾斜看起來很自然,不修)。
+    修正時把各條帶往反方向移回去。
+    """
+    if len(residuals) < 3:
+        return np.zeros_like(residuals)
+    n, bands, _ = residuals.shape
+    pos = np.cumsum(residuals, axis=0).reshape(n, -1)
+    return (pos - _gauss_smooth(pos, sigma)).reshape(n, bands, 2)
+
+
+def apply_stabilization(frame: np.ndarray, correction: np.ndarray, zoom: float,
+                        rs: np.ndarray | None = None, strip: int = 16) -> np.ndarray:
+    """套用補償量並放大 zoom 倍以裁掉黑邊(以影格中心為軸)。
+
+    rs 為各條帶的果凍偏移 (bands, 2):分條帶(每 strip 列)各自多平移 -偏移,
+    偏移在條帶中心之間線性內插,條帶交界不會有斷層。
+    """
     h, w = frame.shape[:2]
     dx, dy, da = correction
     c, s = np.cos(da) * zoom, np.sin(da) * zoom
     cx, cy = w / 2, h / 2
     m = np.array([[c, -s, cx - c * cx + s * cy + dx],
-                  [s, c, cy - s * cx - c * cy + dy]], dtype=np.float32)
+                  [s, c, cy - s * cx - c * cy + dy]], dtype=np.float64)
     # Lanczos 取樣:雙線性在放大時會把細節抹掉約三成,Lanczos 只損失約一成。
-    return cv2.warpAffine(frame, m, (w, h), flags=cv2.INTER_LANCZOS4,
-                          borderMode=cv2.BORDER_REPLICATE)
+    if rs is None or not np.any(rs):
+        return cv2.warpAffine(frame, m.astype(np.float32), (w, h), flags=cv2.INTER_LANCZOS4,
+                              borderMode=cv2.BORDER_REPLICATE)
+    bands = len(rs)
+    centers = (np.arange(bands) + 0.5) * h / bands
+    out = np.empty_like(frame)
+    for y0 in range(0, h, strip):
+        hs = min(strip, h - y0)
+        # 輸出列對應的原影格列(忽略微小旋轉):果凍偏移是按原影格的列量測的。
+        yc = cy + (y0 + hs / 2 - cy - dy) / zoom
+        ms = m.copy()
+        ms[0, 2] -= np.interp(yc, centers, rs[:, 0])
+        ms[1, 2] -= np.interp(yc, centers, rs[:, 1]) + y0
+        out[y0:y0 + hs] = cv2.warpAffine(frame, ms.astype(np.float32), (w, hs),
+                                         flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+    return out
 
 
 # --------------------------------------------------------------- 色調錨定
