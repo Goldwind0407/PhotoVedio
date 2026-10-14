@@ -95,7 +95,7 @@ python_engine/           電腦版演算法與驗證工具(與 lib/engine 逐函
 
 ## 開發
 
-需要 Flutter 3.41 以上（Dart 3.11）。
+需要支援 Dart 3.11 以上的 Flutter（見 `pubspec.yaml`）。
 
 ```bash
 flutter pub get
