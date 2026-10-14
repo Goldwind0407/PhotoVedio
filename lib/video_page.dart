@@ -34,6 +34,51 @@ class _VideoPageState extends State<VideoPage> {
   double _progress = 0;
   String _stage = '';
 
+  // 閃退紀錄:處理中定期寫下目前進度與記憶體用量,正常結束就刪除。
+  // 若 App 在處理中被系統關掉(多半是記憶體不足),下次打開這頁會顯示停在哪裡。
+  File? _crashLog;
+  String _lastLogged = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _checkLastCrash();
+  }
+
+  Future<void> _checkLastCrash() async {
+    final dir = await getApplicationSupportDirectory();
+    final f = _crashLog = File('${dir.path}${Platform.pathSeparator}video_progress.txt');
+    if (!f.existsSync()) return;
+    final info = f.readAsStringSync().trim();
+    f.deleteSync();
+    if (!mounted || info.isEmpty) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('上次處理意外中斷'),
+        content: Text('App 在處理影片時被關閉,通常是手機記憶體不足。\n\n$info'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('知道了')),
+        ],
+      ),
+    );
+  }
+
+  /// [key] 不變時不重寫(進度每 2% 才寫一次)。
+  void _logProgress(String key, String text) {
+    if (key == _lastLogged) return;
+    _lastLogged = key;
+    try {
+      _crashLog?.writeAsStringSync(text, flush: true);
+    } catch (_) {}
+  }
+
+  void _clearLog() {
+    try {
+      _crashLog?.deleteSync();
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
     _player?.dispose();
@@ -78,6 +123,17 @@ class _VideoPageState extends State<VideoPage> {
       _progress = 0;
       _stage = '準備中';
     });
+    // 處理時暫停預覽:播放器自己也要解碼影片,4K 時會和處理搶記憶體。
+    await player.pause();
+    final size = player.value.size;
+    final settings = [
+      '${size.width.round()}×${size.height.round()}',
+      if (_enhance) '提高畫質(${_enhanceLevel.name})',
+      if (_dehaze) '除霧',
+      if (_stabilize) '防手震(${_stabilizeLevel.name})',
+    ].join('、');
+    _lastLogged = '';
+    _logProgress('準備中', '影片:$settings\n停在:準備中');
     try {
       final dir = await getTemporaryDirectory();
       final stamp = DateTime.now().millisecondsSinceEpoch;
@@ -94,6 +150,8 @@ class _VideoPageState extends State<VideoPage> {
           stabilizeLevel: _stabilizeLevel,
         ),
         onProgress: (stage, p) {
+          final at = '$stage ${(p * 50).floor() * 2}%';
+          _logProgress(at, '影片:$settings\n停在:$at\n記憶體用量:約 ${ProcessInfo.currentRss >> 20} MB');
           if (!mounted) return;
           setState(() {
             _stage = stage;
@@ -108,6 +166,7 @@ class _VideoPageState extends State<VideoPage> {
     } catch (e) {
       _toast('$e');
     } finally {
+      _clearLog();
       if (mounted) setState(() => _busy = false);
     }
   }

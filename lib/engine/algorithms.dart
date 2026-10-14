@@ -33,6 +33,19 @@ class _Scope {
     return m;
   }
 
+  /// 不再需要的大型暫存立刻釋放,不等到離開範圍(4K 時每張浮點圖就有數十 MB)。
+  void drop(cv.Mat m) => take(m).dispose();
+
+  /// 在內層範圍執行 [body]:它的暫存一結束就釋放,只有回傳值留在本範圍。
+  cv.Mat inner(cv.Mat Function(_Scope s) body) {
+    final s = _Scope();
+    try {
+      return keep(s.take(body(s)));
+    } finally {
+      s.dispose();
+    }
+  }
+
   void dispose() {
     for (final d in _disposers) {
       d();
@@ -49,20 +62,36 @@ Float32List _f32(cv.Mat m) {
 // --------------------------------------------------------------- 除霧
 
 /// 灰階導向濾波(He et al.),把粗糙的透射率貼合影像邊緣。
+/// 暫存用完立刻釋放,同時存在的浮點圖最多約 5 張(4K 分條處理時峰值記憶體的主要來源)。
 cv.Mat _guidedFilter(_Scope s, cv.Mat guide, cv.Mat src, int r, double eps) {
   final k = (2 * r + 1, 2 * r + 1);
-  cv.Mat box(cv.Mat m) => s.keep(cv.boxFilter(m, -1, k));
-  final meanI = box(guide);
-  final meanP = box(src);
-  final cov = s.keep(cv.subtract(
-      box(s.keep(cv.multiply(guide, src))), s.keep(cv.multiply(meanI, meanP))));
-  final varI = s.keep(cv.subtract(
-      box(s.keep(cv.multiply(guide, guide))), s.keep(cv.multiply(meanI, meanI))));
-  final varEps = s.keep(varI.convertTo(cv.MatType.CV_32FC1, beta: eps));
-  final a = s.keep(cv.divide(cov, varEps));
-  final b = s.keep(cv.subtract(meanP, s.keep(cv.multiply(a, meanI))));
-  return s.keep(
-      cv.add(s.keep(cv.multiply(box(a), guide)), box(b)));
+  cv.Mat box(_Scope t, cv.Mat m) => t.keep(cv.boxFilter(m, -1, k));
+  final meanI = box(s, guide);
+  final meanP = box(s, src);
+  // cov = mean(I·p) - meanI·meanP
+  final cov = s.inner((t) => t.keep(cv.subtract(
+      box(t, t.keep(cv.multiply(guide, src))), t.keep(cv.multiply(meanI, meanP)))));
+  // a = cov / (var(I) + eps)
+  final a = s.inner((t) {
+    final varI = t.keep(cv.subtract(
+        box(t, t.keep(cv.multiply(guide, guide))), t.keep(cv.multiply(meanI, meanI))));
+    final varEps = t.keep(varI.convertTo(cv.MatType.CV_32FC1, beta: eps));
+    return t.keep(cv.divide(cov, varEps));
+  });
+  s.drop(cov);
+  final b = s.inner((t) => t.keep(cv.subtract(meanP, t.keep(cv.multiply(a, meanI)))));
+  s
+    ..drop(meanP)
+    ..drop(meanI);
+  final meanA = box(s, a);
+  s.drop(a);
+  final meanB = box(s, b);
+  s.drop(b);
+  final q = s.inner((t) => t.keep(cv.add(t.keep(cv.multiply(meanA, guide)), meanB)));
+  s
+    ..drop(meanA)
+    ..drop(meanB);
+  return q;
 }
 
 cv.Mat _darkChannel(_Scope s, cv.Mat img, cv.Mat kernel) {
@@ -558,7 +587,9 @@ class DetailEnhancer {
     final r1 = (2 * k + 0.5).floor(), r2 = (8 * k + 0.5).floor();
     // 分條的重疊要大於濾波器的作用範圍,結果才會與整張處理相同。
     final overlap = math.max(this.overlap, 3 * (r1 + r2));
-    final step = (h / strips).ceil();
+    // 每條最多約 2M 像素(不含重疊),解析度更高的影片自動多分幾條。
+    final n = math.max(strips, (w * h / (1 << 21)).ceil());
+    final step = (h / n).ceil();
     for (var y0 = 0; y0 < h; y0 += step) {
       final y1 = math.min(h, y0 + step);
       final top = math.max(0, y0 - overlap), bottom = math.min(h, y1 + overlap);
@@ -576,36 +607,55 @@ class DetailEnhancer {
     return out;
   }
 
+  // 各階段的暫存在內層範圍算完就釋放,用不到的中間結果也立刻丟掉:
+  // 原本所有暫存留到整條算完才釋放,4K 每條要近 1GB,手機會因記憶體不足閃退。
   cv.Mat _enhanceStrip(_Scope s, cv.Mat strip, double sigma, int r1, int r2) {
-    final f = s.keep(strip.convertTo(cv.MatType.CV_32FC3));
-    final y = _lumaOf(s, f);
-    final b1 = _guidedFilter(s, y, y, r1, math.pow(0.04 * 255, 2).toDouble());
-    final b2 = _guidedFilter(s, b1, b1, r2, math.pow(0.08 * 255, 2).toDouble());
+    final y = s.inner((t) => _lumaOf(t, t.keep(strip.convertTo(cv.MatType.CV_32FC3))));
+    final b1 = s.inner((t) => _guidedFilter(t, y, y, r1, math.pow(0.04 * 255, 2).toDouble()));
+    final b2 = s.inner((t) => _guidedFilter(t, b1, b1, r2, math.pow(0.08 * 255, 2).toDouble()));
     final d1 = s.keep(cv.subtract(y, b1));
     final d2 = s.keep(cv.subtract(b1, b2));
+    s
+      ..drop(y)
+      ..drop(b1)
+      ..drop(b2);
     final t = 1.5 * sigma;
-    final d1c = _soft(s, d1, t);
-    final d2c = _soft(s, d2, 0.5 * t);
+    final d1c = s.inner((u) => _soft(u, d1, t));
+    final d2c = s.inner((u) => _soft(u, d2, 0.5 * t));
+    s.drop(d2);
 
     // 紋理遮罩:局部細節能量明顯高於雜訊的地方才增強。
-    final energy = s.keep(cv.sqrt(s.keep(cv.boxFilter(s.keep(cv.multiply(d1, d1)), -1, (9, 9)))));
-    final ramp = 1.5 * sigma + 1.0;
-    final wRaw = s.keep(energy.convertTo(cv.MatType.CV_32FC1,
-        alpha: 1 / ramp, beta: -(1.5 * sigma + 0.8) / ramp));
-    final wMask = s.keep(cv.gaussianBlur(_clamp(s, wRaw, 0, 1), (0, 0), 3));
+    final wMask = s.inner((u) {
+      final energy =
+          u.keep(cv.sqrt(u.keep(cv.boxFilter(u.keep(cv.multiply(d1, d1)), -1, (9, 9)))));
+      final ramp = 1.5 * sigma + 1.0;
+      final wRaw = u.keep(energy.convertTo(cv.MatType.CV_32FC1,
+          alpha: 1 / ramp, beta: -(1.5 * sigma + 0.8) / ramp));
+      return u.keep(cv.gaussianBlur(_clamp(u, wRaw, 0, 1), (0, 0), 3));
+    });
 
-    final boost = s.keep(cv.addWeighted(d1c, fine, d2c, medium, 0));
-    var delta = s.keep(cv.multiply(wMask, boost));
-    // 雜訊明顯(σ > 2)才降噪:扣掉被判定為雜訊的細尺度振幅。
-    final dn = ((sigma - 2.0) / 4.0).clamp(0.0, 1.0);
-    if (dn > 0) {
-      final noise = s.keep(cv.subtract(d1, d1c));
-      delta = s.keep(cv.addWeighted(delta, 1, noise, -dn, 0));
-    }
-    delta = _clamp(s, delta, -maxDelta, maxDelta);
+    final delta = s.inner((u) {
+      final boost = u.keep(cv.addWeighted(d1c, fine, d2c, medium, 0));
+      var delta = u.keep(cv.multiply(wMask, boost));
+      // 雜訊明顯(σ > 2)才降噪:扣掉被判定為雜訊的細尺度振幅。
+      final dn = ((sigma - 2.0) / 4.0).clamp(0.0, 1.0);
+      if (dn > 0) {
+        final noise = u.keep(cv.subtract(d1, d1c));
+        delta = u.keep(cv.addWeighted(delta, 1, noise, -dn, 0));
+      }
+      return _clamp(u, delta, -maxDelta, maxDelta);
+    });
+    s
+      ..drop(d1)
+      ..drop(d1c)
+      ..drop(d2c)
+      ..drop(wMask);
 
-    final delta3 = s.keep(cv.merge(s.keepVec(cv.VecMat.fromList([delta, delta, delta]))));
-    final sum = s.keep(cv.add(f, delta3));
-    return s.keep(sum.convertTo(cv.MatType.CV_8UC3)); // 8U 自動飽和裁切
+    return s.inner((u) {
+      final f = u.keep(strip.convertTo(cv.MatType.CV_32FC3));
+      final delta3 = u.keep(cv.merge(u.keepVec(cv.VecMat.fromList([delta, delta, delta]))));
+      final sum = u.keep(cv.add(f, delta3));
+      return u.keep(sum.convertTo(cv.MatType.CV_8UC3)); // 8U 自動飽和裁切
+    });
   }
 }
