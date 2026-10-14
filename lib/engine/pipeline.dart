@@ -194,6 +194,27 @@ Future<VideoInfo> _probe(String src) async {
 
 String _lastFfmpegError = '';
 
+// ------------------------------------------------------------------ 取消
+
+/// 使用者取消處理時 [processVideo] 丟出的例外。
+class VideoCancelled implements Exception {
+  const VideoCancelled();
+  @override
+  String toString() => '已取消';
+}
+
+bool _cancelRequested = false;
+
+/// 取消進行中的 [processVideo]:停止所有 FFmpeg 工作,背景 isolate 會因管道關閉而結束。
+Future<void> cancelVideoProcessing() async {
+  _cancelRequested = true;
+  await FFmpegKit.cancel();
+}
+
+void _checkCancelled() {
+  if (_cancelRequested) throw const VideoCancelled();
+}
+
 /// 啟動 FFmpeg(非同步),完成時回傳 session 的結果。
 Future<ReturnCode?> _ffmpeg(List<String> args, {void Function()? onDone}) {
   final c = Completer<ReturnCode?>();
@@ -410,7 +431,9 @@ Future<VideoReport> processVideo(
   ProgressCallback? onProgress,
 }) async {
   void progress(_Progress p) => onProgress?.call(p.stage, p.fraction);
+  _cancelRequested = false;
   final info = await _probe(src);
+  _checkCancelled();
   final frames =
       options.maxFrames > 0 ? math.min(info.frames, options.maxFrames) : info.frames;
   // 工作解析度:長邊超過上限就等比縮小(取偶數)。
@@ -506,6 +529,7 @@ Future<VideoReport> processVideo(
       }
     }
 
+    _checkCancelled();
     // ---- 階段 2:解碼 → OpenCV → 編碼 ----
     final outW = workW, outH = workH;
     final inPipe = await newPipe();
@@ -568,13 +592,22 @@ Future<VideoReport> processVideo(
       progress,
     ).whenComplete(() => finished = true);
 
+    _checkCancelled();
     onProgress?.call('收尾', 1.0);
     final enc = await encode;
     await decode;
+    _checkCancelled();
     if (!ReturnCode.isSuccess(enc)) {
       throw Exception('編碼失敗:$_lastFfmpegError');
     }
     return report;
+  } catch (_) {
+    // 取消後各階段會因管道中斷而各自報錯,統一成「已取消」,並刪掉不完整的輸出檔。
+    try {
+      File(dst).deleteSync();
+    } catch (_) {}
+    if (_cancelRequested) throw const VideoCancelled();
+    rethrow;
   } finally {
     for (final p in pipes) {
       await FFmpegKitConfig.closeFFmpegPipe(p);
