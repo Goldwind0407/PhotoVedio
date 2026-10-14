@@ -611,7 +611,7 @@ class _PhotoEditorPageState extends State<PhotoEditorPage> {
               child: _ToggleCard(
                 icon: Icons.blur_off,
                 title: '除霧',
-                subtitle: '讓霧濛濛的照片變清楚',
+                subtitle: '讓畫面更通透',
                 selected: _dehaze,
                 onTap: () {
                   setState(() => _dehaze = !_dehaze);

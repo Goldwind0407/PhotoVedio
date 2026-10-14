@@ -28,6 +28,7 @@ class _VideoPageState extends State<VideoPage> {
   bool _saved = false;
   bool _saving = false;
   String? _resultNote; // 處理完的說明(例如防手震裁切了多少)
+  String? _loadError; // 影片無法播放時的原因
 
   bool _stabilize = true;
   StabilizeLevel _stabilizeLevel = StabilizeLevel.standard;
@@ -141,11 +142,12 @@ class _VideoPageState extends State<VideoPage> {
       _showOutput = false;
       _saved = false;
       _resultNote = null;
+      _loadError = null;
     });
     try {
       await _load(path);
     } catch (e) {
-      _toast('無法播放這段影片:$e');
+      if (mounted) setState(() => _loadError = '$e');
     }
   }
 
@@ -392,6 +394,30 @@ class _VideoPageState extends State<VideoPage> {
 
   Widget _videoArea() {
     final p = _player;
+    final error = _loadError;
+    if (error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.error_outline, size: 48),
+              const SizedBox(height: 12),
+              const Text('無法播放這段影片'),
+              const SizedBox(height: 4),
+              Text(error,
+                  textAlign: TextAlign.center,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+              const SizedBox(height: 16),
+              FilledButton.tonal(onPressed: _pick, child: const Text('換一段影片')),
+            ],
+          ),
+        ),
+      );
+    }
     if (p == null) return const Center(child: CircularProgressIndicator());
     return Column(
       children: [
