@@ -11,19 +11,20 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from algorithms import (Dehazer, DetailEnhancer, ToneAnchor, apply_stabilization, estimate_motion,
-                        smooth_trajectory)
+from algorithms import (STABILIZE_LEVELS, Dehazer, DetailEnhancer, ToneAnchor, apply_stabilization,
+                        estimate_motion, smoothing_sigma, stabilization_zoom, stabilize_path)
 
 
 @dataclass
 class Options:
     enhance: bool = False       # 提高畫質:雜訊感知、邊緣感知的亮度細節增強
+    enhance_level: str = "medium"  # low / medium / high
     dehaze: bool = False
     dehaze_strength: float = 0.6
     tone_anchor: bool = True    # 最後把亮度/色彩拉回原片
     stabilize: bool = False
-    smooth_radius: int = 15     # 防手震平滑視窗(影格數)
-    zoom: float = 1.05          # 防手震裁切放大,蓋住邊緣
+    stabilize_level: str = "standard"  # standard / strong(裁切較多、更穩)
+    zoom: float = 0             # 防手震裁切放大;0 = 依修正量自動計算
 
 
 Progress = Callable[[str, float], None]
@@ -71,7 +72,6 @@ def process_video(src: str, dst: str, opt: Options,
     corrections = None
     if opt.stabilize:
         motions = _analyze_motion(src, report)
-        corrections = smooth_trajectory(motions, opt.smooth_radius)
 
     cap = cv2.VideoCapture(src)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -79,6 +79,11 @@ def process_video(src: str, dst: str, opt: Options,
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out_size = (w // 2 * 2, h // 2 * 2)  # 編碼器要求偶數
+    zoom = opt.zoom
+    if opt.stabilize:
+        budget, rot_budget, max_zoom = STABILIZE_LEVELS[opt.stabilize_level]
+        corrections = stabilize_path(motions, w, h, budget, rot_budget, smoothing_sigma(fps))
+        zoom = zoom or stabilization_zoom(corrections, w, h, max_zoom=max_zoom)
 
     have_ffmpeg = shutil.which("ffmpeg") is not None
     tmp_video = Path(tempfile.mkdtemp()) / "video_only.mp4" if have_ffmpeg else Path(dst)
@@ -89,14 +94,14 @@ def process_video(src: str, dst: str, opt: Options,
     dehazer = Dehazer(opt.dehaze_strength) if opt.dehaze else None
     # 新版畫質增強不改變色調;只有除霧會改變亮度分佈,才需要錨定回原片。
     anchor = ToneAnchor() if opt.tone_anchor and opt.dehaze else None
-    enhancer = DetailEnhancer() if opt.enhance else None
+    enhancer = DetailEnhancer.level(opt.enhance_level) if opt.enhance else None
     i = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         if corrections is not None and i < len(corrections):
-            frame = apply_stabilization(frame, corrections[i], opt.zoom)
+            frame = apply_stabilization(frame, corrections[i], zoom)
         ref = frame if anchor else None
         if dehazer:
             frame = dehazer(frame)

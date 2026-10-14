@@ -9,6 +9,10 @@ import 'dart:typed_data';
 
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
+import 'trajectory.dart';
+
+export 'trajectory.dart';
+
 /// 收集暫存物件,離開時一次釋放。
 class _Scope {
   final _disposers = <void Function()>[];
@@ -224,12 +228,6 @@ class Dehazer {
 
 // --------------------------------------------------------------- 防手震
 
-class Motion {
-  const Motion(this.dx, this.dy, this.da);
-  static const zero = Motion(0, 0, 0);
-  final double dx, dy, da;
-}
-
 /// 兩張相鄰灰階影格間的位移與旋轉角(特徵點光流 + RANSAC 穩健仿射)。
 Motion estimateMotion(cv.Mat prevGray, cv.Mat gray) {
   final corners = cv.goodFeaturesToTrack(prevGray, 300, 0.01, 20, blockSize: 3);
@@ -253,10 +251,15 @@ Motion estimateMotion(cv.Mat prevGray, cv.Mat gray) {
     final (m, inliers) = cv.estimateAffinePartial2D(f, t,
         method: cv.RANSAC, ransacReprojThreshold: 3.0);
     if (!m.isEmpty) {
+      // m 是繞左上角原點的旋轉 + 平移;防手震是繞畫面中心旋轉,要換算成繞中心的平移,
+      // 否則每格的旋轉會被誤算成「中心 × 角度」的平移(720p 轉 0.2° 就差 2px),反而加入抖動。
+      final a = math.atan2(m.atF64(1, i1: 0), m.atF64(0, i1: 0));
+      final cx = prevGray.cols / 2, cy = prevGray.rows / 2;
+      final c = math.cos(a), s = math.sin(a);
       result = Motion(
-        m.atF64(0, i1: 2),
-        m.atF64(1, i1: 2),
-        math.atan2(m.atF64(1, i1: 0), m.atF64(0, i1: 0)),
+        m.atF64(0, i1: 2) - (cx - (c * cx - s * cy)),
+        m.atF64(1, i1: 2) - (cy - (s * cx + c * cy)),
+        a,
       );
     }
     m.dispose();
@@ -269,79 +272,6 @@ Motion estimateMotion(cv.Mat prevGray, cv.Mat gray) {
   status?.dispose();
   err?.dispose();
   return result;
-}
-
-/// numpy 'reflect' 邊界(鏡射但不重複邊緣點)。
-int _reflect(int i, int n) {
-  if (n == 1) return 0;
-  while (i < 0 || i >= n) {
-    if (i < 0) i = -i;
-    if (i >= n) i = 2 * (n - 1) - i;
-  }
-  return i;
-}
-
-/// 累積成軌跡後做移動平均,回傳每格要補償的量(平滑軌跡 - 原軌跡)。
-List<Motion> smoothTrajectory(List<Motion> motions, int radius) {
-  final n = motions.length;
-  if (radius <= 0 || n < 3) return List.filled(n, Motion.zero);
-
-  final traj = List.generate(3, (_) => Float64List(n));
-  var x = 0.0, y = 0.0, a = 0.0;
-  for (var i = 0; i < n; i++) {
-    x += motions[i].dx;
-    y += motions[i].dy;
-    a += motions[i].da;
-    traj[0][i] = x;
-    traj[1][i] = y;
-    traj[2][i] = a;
-  }
-  double avg(Float64List v, int i) {
-    var sum = 0.0;
-    for (var k = -radius; k <= radius; k++) {
-      sum += v[_reflect(i + k, n)];
-    }
-    return sum / (2 * radius + 1);
-  }
-
-  return [
-    for (var i = 0; i < n; i++)
-      Motion(avg(traj[0], i) - traj[0][i], avg(traj[1], i) - traj[1][i],
-          avg(traj[2], i) - traj[2][i]),
-  ];
-}
-
-/// 把每格修正量限制在畫面每邊 [budget] 比例以內,控制防手震需要的裁切放大。
-/// 實測:視窗 15 格、上限 1.5% 時只需放大 3.5%,仍保有約 60% 的抖動降低;
-/// 不設上限則要放大近 9%,細節損失會抵銷畫質增強。超出上限的多半是快速運鏡,本來就不該修。
-/// 對應 python_engine/algorithms.py 的 limit_corrections。
-List<Motion> limitCorrections(List<Motion> c, int w, int h, {double budget = 0.015}) => [
-      for (final m in c)
-        Motion(
-          m.dx.clamp(-budget * w, budget * w),
-          m.dy.clamp(-budget * h, budget * h),
-          m.da.clamp(-budget, budget),
-        ),
-    ];
-
-/// 剛好蓋住修正後黑邊所需的放大倍率(取 99 百分位,避免單一極端值放大整支影片)。
-/// 固定放大 5% 會無謂地損失解析度;晃動小的影片只需要放大 1~2%。
-/// 對應 python_engine/algorithms.py 的 stabilization_zoom。
-double stabilizationZoom(List<Motion> c, int w, int h, {double maxZoom = 1.08}) {
-  if (c.isEmpty) return 1.0;
-  double p99(Iterable<double> v) {
-    final s = v.map((e) => e.abs()).toList()..sort();
-    final pos = 0.99 * (s.length - 1);
-    final lo = pos.floor(), hi = pos.ceil();
-    return s[lo] + (s[hi] - s[lo]) * (pos - lo);
-  }
-
-  final dx = p99(c.map((m) => m.dx)) / w;
-  final dy = p99(c.map((m) => m.dy)) / h;
-  final da = p99(c.map((m) => m.da));
-  // 平移每邊需要 2×位移比例;旋轉 θ 時角落外露約 θ×(長邊/短邊)。
-  final need = 1.0 + 2.0 * math.max(dx, dy) + da * math.max(w, h) / math.min(w, h);
-  return need.clamp(1.0, maxZoom);
 }
 
 /// 套用補償量並以影格中心放大 [zoom] 倍,裁掉黑邊。回傳新的 Mat。
@@ -519,16 +449,28 @@ cv.Mat _clamp(_Scope s, cv.Mat m, double lo, double hi) {
 /// 4K 的浮點中間結果很大,所以分條處理:每條上下多取 [overlap] 像素(大於濾波器作用範圍),
 /// 只寫回中間部分,結果與整張處理相同,峰值記憶體約為 1/[strips]。
 /// 對應 python_engine/algorithms.py 的 DetailEnhancer。
+enum EnhanceLevel {
+  low(0.6, 0.35, 14.0),
+  medium(0.8, 0.7, 20.0),
+  high(1.1, 1.1, 28.0);
+
+  const EnhanceLevel(this.fineAmount, this.mediumAmount, this.maxDelta);
+  final double fineAmount, mediumAmount, maxDelta; // 細尺度/中尺度增強量、單像素最大變化
+}
+
 class DetailEnhancer {
   DetailEnhancer({
-    this.fine = 0.6,
-    this.medium = 0.35,
+    this.fine = 0.8,
+    this.medium = 0.7,
     this.smooth = 0.9,
-    this.maxDelta = 14.0,
+    this.maxDelta = 20.0,
     this.strips = 4,
     this.overlap = 48,
     this.noiseEvery = 15,
   });
+
+  DetailEnhancer.level(EnhanceLevel l, {int strips = 4})
+      : this(fine: l.fineAmount, medium: l.mediumAmount, maxDelta: l.maxDelta, strips: strips);
 
   final double fine; // 細尺度(紋理、毛髮)增強量
   final double medium; // 中尺度(輪廓、局部立體感)增強量
@@ -568,6 +510,12 @@ class DetailEnhancer {
     final sigma = _sigma!;
     final out = cv.Mat.zeros(frame.rows, frame.cols, cv.MatType.CV_8UC3);
     final h = frame.rows, w = frame.cols;
+    // 濾波半徑依解析度放大(以短邊 1080 為基準):4K 影片在手機上是縮小觀看的,
+    // 只增強單一像素尺度的細節幾乎看不出來。半徑要以整張影格計算,不能用分條後的尺寸。
+    final k = math.max(1.0, math.min(w, h) / 1080);
+    final r1 = (2 * k + 0.5).floor(), r2 = (8 * k + 0.5).floor();
+    // 分條的重疊要大於濾波器的作用範圍,結果才會與整張處理相同。
+    final overlap = math.max(this.overlap, 3 * (r1 + r2));
     final step = (h / strips).ceil();
     for (var y0 = 0; y0 < h; y0 += step) {
       final y1 = math.min(h, y0 + step);
@@ -575,7 +523,7 @@ class DetailEnhancer {
       final s = _Scope();
       try {
         final src = s.keep(frame.region(cv.Rect(0, top, w, bottom - top)));
-        final res = _enhanceStrip(s, src, sigma);
+        final res = _enhanceStrip(s, src, sigma, r1, r2);
         final inner = s.keep(res.region(cv.Rect(0, y0 - top, w, y1 - y0)));
         final dst = s.keep(out.region(cv.Rect(0, y0, w, y1 - y0)));
         inner.copyTo(dst);
@@ -586,11 +534,11 @@ class DetailEnhancer {
     return out;
   }
 
-  cv.Mat _enhanceStrip(_Scope s, cv.Mat strip, double sigma) {
+  cv.Mat _enhanceStrip(_Scope s, cv.Mat strip, double sigma, int r1, int r2) {
     final f = s.keep(strip.convertTo(cv.MatType.CV_32FC3));
     final y = _lumaOf(s, f);
-    final b1 = _guidedFilter(s, y, y, 2, math.pow(0.04 * 255, 2).toDouble());
-    final b2 = _guidedFilter(s, b1, b1, 8, math.pow(0.08 * 255, 2).toDouble());
+    final b1 = _guidedFilter(s, y, y, r1, math.pow(0.04 * 255, 2).toDouble());
+    final b2 = _guidedFilter(s, b1, b1, r2, math.pow(0.08 * 255, 2).toDouble());
     final d1 = s.keep(cv.subtract(y, b1));
     final d2 = s.keep(cv.subtract(b1, b2));
     final t = 1.5 * sigma;

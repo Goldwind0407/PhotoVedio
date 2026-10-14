@@ -26,34 +26,33 @@ import 'algorithms.dart';
 class EngineOptions {
   const EngineOptions({
     this.enhance = false,
-    this.detailFine = 0.6,
-    this.detailMedium = 0.35,
+    this.enhanceLevel = EnhanceLevel.medium,
     this.dehaze = false,
     this.dehazeStrength = 0.6,
     this.dehazeChroma = 0.35,
     this.toneAnchor = true,
     this.anchorChroma = 0.0,
     this.stabilize = false,
-    this.smoothRadius = 15,
+    this.stabilizeLevel = StabilizeLevel.standard,
     this.zoom = 0,
     this.maxFrames = 0,
-    this.shakeThreshold = 1.0e-3,
+    this.shakeThreshold = 0.4e-3,
     this.maxLongSide = 0,
   });
 
   final bool enhance; // 提高畫質:雜訊感知、邊緣感知的亮度細節增強(DetailEnhancer)
-  final double detailFine, detailMedium; // 細尺度/中尺度細節增強量
+  final EnhanceLevel enhanceLevel;
   final bool dehaze;
   final double dehazeStrength;
   final bool toneAnchor; // 最後把亮度/色彩拉回原片(建議開啟)
   final double anchorChroma; // 錨定時色度取自處理後影格的比例
   final double dehazeChroma; // 去霧後色度取自去霧結果的比例(越小越接近原片色彩)
   final bool stabilize;
-  final int smoothRadius; // 防手震平滑視窗(影格數)
+  final StabilizeLevel stabilizeLevel;
   final double zoom; // 防手震裁切放大;0 = 依修正量自動計算(剛好蓋住黑邊)
   final int maxFrames; // 只處理前 N 格(測試/預覽用),0 = 全部
   // 晃動門檻(高頻抖動 / 畫面長邊)。低於此值視為穩定、不做防手震。
-  // 依實測:明顯手震約 1.6e-3,一般手持約 0.2~0.6e-3。
+  // 依實測:明顯手震約 1.6e-3,一般手持約 0.2~0.6e-3;0.4e-3 約等於 1080p 上 0.8px 的抖動。
   final double shakeThreshold;
   // 工作解析度上限(長邊像素)。4K 單格 BGR 就 25 MB、浮點中間結果更大,
   // 手機記憶體撐不住,所以解碼時就先縮小。0 = 保持原尺寸。
@@ -64,8 +63,15 @@ class EngineOptions {
 
 typedef ProgressCallback = void Function(String stage, double fraction);
 
-/// 最近一次處理的晃動分數(測試/除錯用)。
-double? lastShakeScore;
+/// 處理結果摘要,讓畫面告訴使用者防手震實際做了什麼。
+class VideoReport {
+  const VideoReport({this.shakeScore, this.stabilized = false, this.zoom = 1.0, this.locked = false});
+
+  final double? shakeScore; // null = 沒開防手震
+  final bool stabilized; // false = 偵測為穩定而略過
+  final double zoom; // 防手震的放大倍率
+  final bool locked; // 用了三腳架鎖定
+}
 
 /// 晃動分數:軌跡偏離其移動平均(視窗 15 格)的平均距離,除以畫面長邊。
 /// 只反映高頻抖動;緩慢平移、刻意運鏡不會被算進去。
@@ -334,7 +340,7 @@ void _renderEntry((Object, SendPort) args) {
     // 新版畫質增強不改變色調;只有除霧會改變亮度分佈,才需要錨定回原片。
     anchor = o.toneAnchor && o.dehaze ? ToneAnchor(chroma: o.anchorChroma) : null;
     final enhancer = o.enhance
-        ? DetailEnhancer(fine: o.detailFine, medium: o.detailMedium)
+        ? DetailEnhancer.level(o.enhanceLevel)
         : null;
     dehazer = o.dehaze ? Dehazer(strength: o.dehazeStrength, chroma: o.dehazeChroma) : null;
     final frame = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC3);
@@ -384,13 +390,13 @@ void _renderEntry((Object, SendPort) args) {
 
 // ------------------------------------------------------------------ 公開入口
 
-Future<void> processVideo(
+Future<VideoReport> processVideo(
   String src,
   String dst,
   EngineOptions options, {
   ProgressCallback? onProgress,
 }) async {
-  void report(_Progress p) => onProgress?.call(p.stage, p.fraction);
+  void progress(_Progress p) => onProgress?.call(p.stage, p.fraction);
   final info = await _probe(src);
   final frames =
       options.maxFrames > 0 ? math.min(info.frames, options.maxFrames) : info.frames;
@@ -410,6 +416,7 @@ Future<void> processVideo(
   try {
     Float64List? corrections;
     var zoom = 1.0;
+    var report = const VideoReport();
 
     // ---- 階段 1:防手震才需要。FFmpeg 直接輸出縮小後的灰階影格,不必在 Dart 端縮圖。 ----
     if (options.stabilize) {
@@ -428,7 +435,7 @@ Future<void> processVideo(
       final motions = await _runIsolate<Float64List>(
         _analysisEntry,
         _AnalysisJob(pipe, aw, ah, frames),
-        report,
+        progress,
       ).whenComplete(() => finished = true);
       final code = await decode;
       if (!ReturnCode.isSuccess(code) && motions.length < 6) {
@@ -443,13 +450,32 @@ Future<void> processVideo(
       ];
       // 自動判斷:不晃的影片不做修正(裁切放大與重新取樣本身會損失畫質)。
       final jitter = shakeScore(list, math.max(workW, workH));
-      final shaky = jitter >= options.shakeThreshold;
+      // 鎖定模式連緩慢漂移也要消除,不看晃動門檻。
+      final shaky =
+          jitter >= options.shakeThreshold || options.stabilizeLevel == StabilizeLevel.lock;
       onProgress?.call(shaky ? '偵測到晃動,套用防手震' : '畫面穩定,略過防手震', 1.0);
-      lastShakeScore = jitter;
+      report = VideoReport(shakeScore: jitter);
       if (shaky) {
-        final smooth = limitCorrections(smoothTrajectory(list, options.smoothRadius), workW, workH);
+        final level = options.stabilizeLevel;
+        var locked = false;
+        List<Motion>? smooth;
+        if (level == StabilizeLevel.lock) {
+          final l = lockTrajectory(list, workW, workH, maxZoom: level.maxZoom);
+          if (l != null) {
+            (smooth, zoom, _) = l;
+            locked = true;
+          }
+        }
+        // 鎖定需要的裁切太多(例如邊走邊拍)時,改用強力平滑。
+        final lv = locked || level != StabilizeLevel.lock ? level : StabilizeLevel.strong;
+        if (smooth == null) {
+          smooth = stabilizePath(list, workW, workH,
+              budget: lv.budget, rotBudget: lv.rotBudget, sigma: smoothingSigma(info.fps));
+          zoom = stabilizationZoom(smooth, workW, workH, maxZoom: lv.maxZoom);
+        }
+        if (options.zoom > 0) zoom = options.zoom;
         corrections = Float64List.fromList([for (final m in smooth) ...[m.dx, m.dy, m.da]]);
-        zoom = options.zoom > 0 ? options.zoom : stabilizationZoom(smooth, workW, workH);
+        report = VideoReport(shakeScore: jitter, stabilized: true, zoom: zoom, locked: locked);
       }
     }
 
@@ -511,7 +537,7 @@ Future<void> processVideo(
         corrections: corrections,
         zoom: zoom,
       ),
-      report,
+      progress,
     ).whenComplete(() => finished = true);
 
     onProgress?.call('收尾', 1.0);
@@ -520,6 +546,7 @@ Future<void> processVideo(
     if (!ReturnCode.isSuccess(enc)) {
       throw Exception('編碼失敗:$_lastFfmpegError');
     }
+    return report;
   } finally {
     for (final p in pipes) {
       await FFmpegKitConfig.closeFFmpegPipe(p);

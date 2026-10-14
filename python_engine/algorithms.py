@@ -118,21 +118,56 @@ def estimate_motion(prev_gray: np.ndarray, gray: np.ndarray) -> tuple[float, flo
                                        ransacReprojThreshold=3.0)
     if m is None:
         return 0.0, 0.0, 0.0
-    return float(m[0, 2]), float(m[1, 2]), float(np.arctan2(m[1, 0], m[0, 0]))
+    # m 是繞左上角原點的旋轉 + 平移;防手震是繞畫面中心旋轉,要換算成繞中心的平移,
+    # 否則每格的旋轉會被誤算成「中心 × 角度」的平移(720p 轉 0.2° 就差 2px),反而加入抖動。
+    a = float(np.arctan2(m[1, 0], m[0, 0]))
+    cx, cy = prev_gray.shape[1] / 2, prev_gray.shape[0] / 2
+    c, s = np.cos(a), np.sin(a)
+    dx = float(m[0, 2]) - (cx - (c * cx - s * cy))
+    dy = float(m[1, 2]) - (cy - (s * cx + c * cy))
+    return dx, dy, a
 
 
-def smooth_trajectory(motions: np.ndarray, radius: int) -> np.ndarray:
-    """累積成軌跡後做移動平均,回傳每格需要補償的 (dx, dy, da)。
+def _gauss_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
+    r = int(3 * sigma)
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k /= k.sum()
+    pad = np.pad(x, ((r, r), (0, 0)), mode="reflect")
+    return np.stack([np.convolve(pad[:, i], k, mode="valid") for i in range(x.shape[1])], axis=1)
 
-    用 reflect 邊界避免開頭結尾被拉向 0;radius 越大越穩,但裁切越多。
+
+# 防手震強度:(每邊平移上限比例, 旋轉上限 rad, 最大放大倍率)
+STABILIZE_LEVELS = {
+    "standard": (0.03, 0.02, 1.12),
+    "strong": (0.05, 0.03, 1.20),
+}
+
+
+def smoothing_sigma(fps: float) -> float:
+    """平滑時間尺度約 0.27 秒,不隨幀率改變。"""
+    return float(np.clip(8.0 * fps / 30.0, 4.0, 16.0))
+
+
+def stabilize_path(motions: np.ndarray, w: int, h: int, budget: float = 0.03,
+                   rot_budget: float = 0.02, sigma: float = 8.0, iters: int = 60) -> np.ndarray:
+    """在裁切上限內找最平滑的鏡頭路徑,回傳每格補償量(平滑路徑 - 原路徑)。
+
+    反覆「高斯平滑 → 夾回原路徑 ± 上限」:路徑保持平滑,又不會超出裁切範圍。
+    sigma 是平滑的時間尺度(影格數),呼叫端依幀率換算(30fps 用 8,見 smoothing_sigma)。
+    舊做法(移動平均後逐格硬截斷)在修正量碰到上限時會讓抖動原封不動漏過去。
+    合成測試(對照舊做法:移動平均 + 1.5% 硬截斷):
+      一般手持(抖動 5.4px/格):殘餘 1.0 → 0.48px(標準)
+      大幅晃動(抖動 13.5px/格):殘餘 5.9 → 2.9px(標準)/ 2.1px(強)
     """
     traj = np.cumsum(motions, axis=0)
-    if radius <= 0 or len(traj) < 3:
-        return np.zeros_like(motions)
-    k = np.ones(2 * radius + 1) / (2 * radius + 1)
-    pad = np.pad(traj, ((radius, radius), (0, 0)), mode="reflect")
-    smooth = np.stack([np.convolve(pad[:, i], k, mode="valid") for i in range(3)], axis=1)
-    return smooth - traj
+    if len(traj) < 3:
+        return np.zeros_like(traj)
+    b = np.array([budget * w, budget * h, rot_budget])
+    p = _gauss_smooth(traj, sigma)
+    for _ in range(iters):
+        # 迭代時用 0.8 倍上限,最後一次平滑後才不會超出上限太多
+        p = _gauss_smooth(np.clip(p, traj - 0.8 * b, traj + 0.8 * b), sigma)
+    return np.clip(p, traj - b, traj + b) - traj
 
 
 def apply_stabilization(frame: np.ndarray, correction: np.ndarray, zoom: float) -> np.ndarray:
@@ -211,8 +246,19 @@ class DetailEnhancer:
     4. 把亮度增量同時加到 B、G、R,色相與飽和度幾乎不變;細節層平均值約為 0,整體亮度不變。
     """
 
-    def __init__(self, fine: float = 0.6, medium: float = 0.35, smooth: float = 0.9,
-                 max_delta: float = 14.0, noise_every: int = 15):
+    LEVELS = {  # (細尺度, 中尺度, 單像素最大變化)
+        "low": (0.6, 0.35, 14.0),
+        "medium": (0.8, 0.7, 20.0),
+        "high": (1.1, 1.1, 28.0),
+    }
+
+    @classmethod
+    def level(cls, name: str) -> "DetailEnhancer":
+        fine, medium, max_delta = cls.LEVELS[name]
+        return cls(fine=fine, medium=medium, max_delta=max_delta)
+
+    def __init__(self, fine: float = 0.8, medium: float = 0.7, smooth: float = 0.9,
+                 max_delta: float = 20.0, noise_every: int = 15):
         self.fine = fine          # 細尺度(紋理、毛髮)增強量
         self.medium = medium      # 中尺度(輪廓、局部立體感)增強量
         self.smooth = smooth
@@ -235,8 +281,11 @@ class DetailEnhancer:
         self._frame += 1
         sigma = self._sigma
 
-        b1 = self._base(y, 2, (0.04 * 255) ** 2)
-        b2 = self._base(b1, 8, (0.08 * 255) ** 2)
+        # 濾波半徑依解析度放大(以短邊 1080 為基準):4K 影片在手機上是縮小觀看的,
+        # 只增強單一像素尺度的細節幾乎看不出來。
+        k = max(1.0, min(frame.shape[:2]) / 1080)
+        b1 = self._base(y, int(2 * k + 0.5), (0.04 * 255) ** 2)
+        b2 = self._base(b1, int(8 * k + 0.5), (0.08 * 255) ** 2)
         d1, d2 = y - b1, b1 - b2
         t = 1.5 * sigma
         d1c, d2c = _soft(d1, t), _soft(d2, 0.5 * t)
@@ -265,19 +314,6 @@ def stabilization_zoom(corrections: np.ndarray, w: int, h: int, max_zoom: float 
     # 平移每邊需要 2×位移比例;旋轉 θ 時角落外露約 θ×(長邊/短邊)。
     need = 1.0 + 2.0 * max(dx, dy) + da * max(w, h) / min(w, h)
     return float(np.clip(need, 1.0, max_zoom))
-
-
-def limit_corrections(corr: np.ndarray, w: int, h: int, budget: float = 0.015) -> np.ndarray:
-    """把每格修正量限制在畫面每邊 budget 比例以內,控制防手震需要的裁切放大。
-
-    在 test5 實測:視窗 15 格、上限 1.5% 時只需放大 3.5%,仍保有約 60% 的抖動降低;
-    不設上限則要放大近 9%,細節損失會抵銷畫質增強。超出上限的多半是快速運鏡,本來就不該修。
-    """
-    c = corr.copy()
-    c[:, 0] = np.clip(c[:, 0], -budget * w, budget * w)
-    c[:, 1] = np.clip(c[:, 1], -budget * h, budget * h)
-    c[:, 2] = np.clip(c[:, 2], -budget, budget)
-    return c
 
 
 def lock_trajectory(motions: np.ndarray, w: int, h: int, max_zoom: float = 1.25

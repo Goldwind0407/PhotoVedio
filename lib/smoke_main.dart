@@ -44,7 +44,7 @@ Future<void> main() async {
   for (var n = only > 0 ? only : 1; File('$ext/v$n.mp4').existsSync(); n++) {
     final sw = Stopwatch()..start();
     try {
-      await processVideo('$ext/v$n.mp4', '$tmp/out_$n.mp4', options,
+      final r = await processVideo('$ext/v$n.mp4', '$tmp/out_$n.mp4', options,
           onProgress: (stage, p) {
         if ((p * 100).round() % 5 == 0) {
           debugPrint('SMOKE v$n $stage ${(p * 100).round()}% rss=${ProcessInfo.currentRss ~/ (1024 * 1024)}MB');
@@ -53,7 +53,7 @@ Future<void> main() async {
       debugPrint('SMOKE v$n OK ${sw.elapsedMilliseconds}ms '
           'out=${File('$tmp/out_$n.mp4').lengthSync()} '
           'maxRssMB=${ProcessInfo.maxRss ~/ (1024 * 1024)} '
-          'shake=${lastShakeScore?.toStringAsExponential(2)}');
+          'shake=${r.shakeScore?.toStringAsExponential(2)} zoom=${r.zoom.toStringAsFixed(3)}');
       if (only > 0) break;
     } catch (err, st) {
       debugPrint('SMOKE v$n FAIL $err $st');

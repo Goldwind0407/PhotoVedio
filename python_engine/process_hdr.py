@@ -4,7 +4,7 @@
   2. FFmpeg 解碼原尺寸 → (防手震)→ 提高畫質(DetailEnhancer)→ FFmpeg 編碼
   3. HDR 原片輸出 10-bit HEVC 並保留 HLG/BT.2020 標註;原音軌直接複製
 
-用法:python process_hdr.py 原片.mp4 輸出.mp4
+用法:python process_hdr.py 原片.mp4 輸出.mp4 [--strong | --lock]
 """
 from __future__ import annotations
 
@@ -15,13 +15,14 @@ import time
 import numpy as np
 
 from algorithms import DetailEnhancer
-from algorithms import (apply_stabilization, estimate_motion, limit_corrections, lock_trajectory,
-                        smooth_trajectory, stabilization_zoom)
+from algorithms import (STABILIZE_LEVELS, apply_stabilization, estimate_motion, lock_trajectory,
+                        smoothing_sigma, stabilization_zoom, stabilize_path)
 from roundtrip import FFMPEG, probe
 
 ANALYSIS_LONG_SIDE = 1280
-SHAKE_THRESHOLD = 1.0e-3  # 與 App 相同:高頻抖動 / 畫面長邊
+SHAKE_THRESHOLD = 0.4e-3  # 與 App 相同:高頻抖動 / 畫面長邊
 LOCK = False  # --lock:三腳架鎖定模式(完全無晃動,裁切較多)
+STRONG = False  # --strong:強力防手震(裁切較多)
 ACC = "accurate_rnd+full_chroma_int+full_chroma_inp"
 
 
@@ -58,8 +59,9 @@ def analyze(src: str, w: int, h: int, matrix: str) -> np.ndarray:
 
 def main() -> int:
     src, dst = sys.argv[1:3]
-    global LOCK
+    global LOCK, STRONG
     LOCK = "--lock" in sys.argv[3:]
+    STRONG = LOCK or "--strong" in sys.argv[3:]
     w, h, fps, hdr = probe(src)
     m = "bt2020" if hdr else "bt709"
     t0 = time.time()
@@ -74,8 +76,9 @@ def main() -> int:
             corr, zoom, deg = locked
             mode = ["鎖定:固定鏡頭", "鎖定:等速運鏡", "鎖定:二次曲線運鏡", "鎖定:三次曲線運鏡"][deg]
         else:
-            corr = limit_corrections(smooth_trajectory(motions, 15), w, h)
-            zoom = stabilization_zoom(corr, w, h)
+            budget, rot_budget, max_zoom = STABILIZE_LEVELS["strong" if STRONG else "standard"]
+            corr = stabilize_path(motions, w, h, budget, rot_budget, smoothing_sigma(fps))
+            zoom = stabilization_zoom(corr, w, h, max_zoom=max_zoom)
             mode = "平滑"
     print(f"晃動分數 {score:.2e}({'有晃動,套用防手震 ' + mode if shaky else '穩定,略過防手震'})  放大 {zoom:.3f}  "
           f"分析 {time.time() - t0:.0f}s", flush=True)

@@ -6,6 +6,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 
+import 'engine/algorithms.dart' show EnhanceLevel, StabilizeLevel;
 import 'engine/pipeline.dart';
 
 /// 影片修復頁:提高畫質、除霧、防手震。處理完成後可預覽並存到相簿。
@@ -23,10 +24,11 @@ class _VideoPageState extends State<VideoPage> {
   bool _showOutput = false;
 
   bool _enhance = true;
+  EnhanceLevel _enhanceLevel = EnhanceLevel.medium;
   bool _dehaze = false;
   double _dehazeStrength = 0.6; // 0 ~ 1
   bool _stabilize = false;
-  double _shakiness = 15; // 平滑視窗(影格數),越大越穩,但鏡頭運動會變得較遲鈍
+  StabilizeLevel _stabilizeLevel = StabilizeLevel.standard;
 
   bool _busy = false;
   double _progress = 0;
@@ -80,15 +82,16 @@ class _VideoPageState extends State<VideoPage> {
       final dir = await getTemporaryDirectory();
       final stamp = DateTime.now().millisecondsSinceEpoch;
       final out = '${dir.path}/fixed_$stamp.mp4';
-      await processVideo(
+      final report = await processVideo(
         src,
         out,
         EngineOptions(
           enhance: _enhance,
+          enhanceLevel: _enhanceLevel,
           dehaze: _dehaze,
           dehazeStrength: _dehazeStrength,
           stabilize: _stabilize,
-          smoothRadius: _shakiness.round(),
+          stabilizeLevel: _stabilizeLevel,
         ),
         onProgress: (stage, p) {
           if (!mounted) return;
@@ -101,12 +104,19 @@ class _VideoPageState extends State<VideoPage> {
       _outputPath = out;
       _showOutput = true;
       await _load(out);
-      _toast('處理完成,可預覽後儲存');
+      _toast('處理完成,可預覽後儲存${_describe(report)}');
     } catch (e) {
       _toast('$e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  String _describe(VideoReport r) {
+    if (r.shakeScore == null) return '';
+    if (!r.stabilized) return '\n畫面本來就很穩定,未套用防手震';
+    final crop = ((1 - 1 / r.zoom) * 100).round();
+    return '\n已${r.locked ? '鎖定鏡頭' : '套用防手震'},畫面裁切約 $crop%';
   }
 
   Future<void> _save() async {
@@ -203,10 +213,21 @@ class _VideoPageState extends State<VideoPage> {
             SwitchListTile(
               dense: true,
               title: const Text('提高畫質'),
-              subtitle: const Text('增強紋理細節,不改變色彩與亮度'),
+              subtitle: const Text('增強紋理與輪廓細節,不改變色彩與亮度'),
               value: _enhance,
               onChanged: _busy ? null : (v) => setState(() => _enhance = v),
             ),
+            if (_enhance)
+              SegmentedButton<EnhanceLevel>(
+                segments: const [
+                  ButtonSegment(value: EnhanceLevel.low, label: Text('弱')),
+                  ButtonSegment(value: EnhanceLevel.medium, label: Text('中')),
+                  ButtonSegment(value: EnhanceLevel.high, label: Text('強')),
+                ],
+                selected: {_enhanceLevel},
+                onSelectionChanged:
+                    _busy ? null : (v) => setState(() => _enhanceLevel = v.first),
+              ),
             SwitchListTile(
               dense: true,
               title: const Text('除霧'),
@@ -223,18 +244,24 @@ class _VideoPageState extends State<VideoPage> {
             SwitchListTile(
               dense: true,
               title: const Text('防手震'),
-              subtitle: const Text('畫面會略微裁切'),
+              subtitle: Text(switch (_stabilizeLevel) {
+                StabilizeLevel.standard => '畫面裁切約 5~10%',
+                StabilizeLevel.strong => '適合走路拍攝,裁切約 10~16%',
+                StabilizeLevel.lock => '像架在腳架上,完全不晃;裁切最多',
+              }),
               value: _stabilize,
               onChanged: _busy ? null : (v) => setState(() => _stabilize = v),
             ),
             if (_stabilize)
-              Slider(
-                value: _shakiness,
-                min: 5,
-                max: 30,
-                divisions: 25,
-                label: _shakiness.round().toString(),
-                onChanged: _busy ? null : (v) => setState(() => _shakiness = v),
+              SegmentedButton<StabilizeLevel>(
+                segments: const [
+                  ButtonSegment(value: StabilizeLevel.standard, label: Text('標準')),
+                  ButtonSegment(value: StabilizeLevel.strong, label: Text('強')),
+                  ButtonSegment(value: StabilizeLevel.lock, label: Text('鎖定')),
+                ],
+                selected: {_stabilizeLevel},
+                onSelectionChanged:
+                    _busy ? null : (v) => setState(() => _stabilizeLevel = v.first),
               ),
             const SizedBox(height: 4),
             if (_busy) ...[
