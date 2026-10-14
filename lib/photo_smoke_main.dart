@@ -25,7 +25,7 @@ Future<void> main() async {
       final bytes = f.readAsBytesSync();
       try {
         final out = await Isolate.run(() => processPhoto(bytes, o));
-        File('$ext/photo_out/${name}_$k.png').writeAsBytesSync(out);
+        File('$ext/photo_out/${name}_$k.png').writeAsBytesSync(out.bytes);
         debugPrint('SMOKE $name $k ${sw.elapsedMilliseconds}ms '
             'maxRss=${ProcessInfo.maxRss >> 20}MB');
       } catch (e) {

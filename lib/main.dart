@@ -124,21 +124,41 @@ class _EditorPageState extends State<EditorPage> {
   bool _enhance = false;
   bool _dehaze = false;
   double _dehazeStrength = 0.6; // 0 ~ 1
-  Uint8List? _preview; // 除霧/提高畫質的預覽結果(縮小尺寸)
+  Uint8List? _preview; // 除霧/提高畫質的預覽結果
   bool _processing = false;
-  int _generation = 0; // 用來丟棄過時的預覽結果
+  bool _previewRunning = false; // 同一時間只跑一個預覽,避免連點時多個 isolate 同時吃記憶體
+  int _generation = 0; // 設定每變一次就加一,用來丟棄過時的預覽結果
+  // 原尺寸處理結果的快取:預覽最後顯示的就是它,儲存時直接沿用,不必重算。
+  Future<PhotoResult>? _full;
+  Uint8List? _fullSrc;
+  PhotoOptions? _fullOpts;
   bool _showOriginal = false; // 長按畫面時顯示原圖
   bool _busy = false;
 
-  /// 預覽在縮小的圖上算,比較快;儲存時才用原尺寸。
+  /// 除霧的快速預覽在縮小的圖上算。
   static const _previewLongSide = 1600;
 
-  PhotoOptions _photoOptions({int maxLongSide = 0}) => PhotoOptions(
+  PhotoOptions _photoOptions() => PhotoOptions(
         enhance: _enhance,
         dehaze: _dehaze,
         dehazeStrength: _dehazeStrength,
-        maxLongSide: maxLongSide,
       );
+
+  /// 原尺寸處理;同一張圖、同一組設定只算一次(預覽與儲存共用)。
+  Future<PhotoResult> _fullResult(Uint8List bytes, PhotoOptions opts) {
+    final cached = _full;
+    if (cached != null && identical(_fullSrc, bytes) && _fullOpts == opts) {
+      return cached;
+    }
+    final f = _processInBackground(bytes, opts);
+    _full = f;
+    _fullSrc = bytes;
+    _fullOpts = opts;
+    f.then((_) {}, onError: (_) {
+      if (identical(_full, f)) _full = null; // 失敗的結果不快取
+    });
+    return f;
+  }
 
   ColorMatrix get _matrix {
     var m = presets[_filter].matrix;
@@ -168,28 +188,44 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   Future<void> _updatePreview() async {
-    final bytes = _bytes;
-    final opts = _photoOptions(maxLongSide: _previewLongSide);
-    final gen = ++_generation;
-    if (bytes == null || !opts.any) {
-      setState(() {
-        _preview = null;
-        _processing = false;
-      });
-      return;
-    }
-    setState(() => _processing = true);
+    _generation++;
+    // 已有預覽在跑:它這一輪結束後發現設定變了,會用最新設定再跑一次。
+    if (_previewRunning) return;
+    _previewRunning = true;
     try {
-      final out = await Isolate.run(() => processPhoto(bytes, opts));
-      if (!mounted || gen != _generation) return;
-      setState(() {
-        _preview = out;
-        _processing = false;
-      });
-    } catch (e) {
-      if (!mounted || gen != _generation) return;
-      setState(() => _processing = false);
-      _toast('處理失敗:$e');
+      while (mounted) {
+        final gen = _generation;
+        final bytes = _bytes;
+        final opts = _photoOptions();
+        if (bytes == null || !opts.any) {
+          setState(() => _preview = null);
+        } else {
+          setState(() => _processing = true);
+          try {
+            // 除霧與影像尺寸無關,先在縮小圖上快速預覽。提高畫質是以像素為單位增強細節,
+            // 縮小圖上看起來會比原尺寸強很多,所以一律等原尺寸結果出來再顯示,
+            // 預覽才會等於存出來的照片。
+            if (opts.dehaze) {
+              final quick = await _processInBackground(
+                  bytes, opts.copyWith(enhance: false, maxLongSide: _previewLongSide));
+              if (!mounted) return;
+              if (gen == _generation) setState(() => _preview = quick.bytes);
+            }
+            if (gen == _generation) {
+              final full = await _fullResult(bytes, opts);
+              if (!mounted) return;
+              if (gen == _generation) setState(() => _preview = full.bytes);
+            }
+          } catch (e) {
+            if (!mounted) return;
+            if (gen == _generation) _toast('處理失敗:$e');
+          }
+        }
+        if (gen == _generation) break;
+      }
+    } finally {
+      _previewRunning = false;
+      if (mounted) setState(() => _processing = false);
     }
   }
 
@@ -197,6 +233,7 @@ class _EditorPageState extends State<EditorPage> {
     final file = await ImagePicker().pickImage(source: ImageSource.gallery);
     if (file == null) return;
     final bytes = await file.readAsBytes();
+    _full = null; // 釋放上一張圖的結果
     setState(() => _bytes = bytes);
     _reset();
   }
@@ -221,17 +258,20 @@ class _EditorPageState extends State<EditorPage> {
       final matrix = _matrix;
       final sharpen = _sharpen;
       final opts = _photoOptions();
-      // 在背景 isolate 處理,避免畫面卡住。除霧/提高畫質用原尺寸重算。
-      final out = await Isolate.run(() =>
-          _render(opts.any ? processPhoto(bytes, opts) : bytes, matrix, sharpen));
+      // 除霧/提高畫質沿用預覽算好的原尺寸結果(還在算就等它),其餘在背景 isolate 套用。
+      final processed = opts.any ? await _fullResult(bytes, opts) : null;
+      final out = await _renderInBackground(processed?.bytes ?? bytes, matrix, sharpen);
+      final note = processed != null && processed.downscaled
+          ? '(原圖超過 $photoMaxLongSide 像素,已縮小為 ${processed.width}×${processed.height})'
+          : '';
       if (Platform.isAndroid || Platform.isIOS) {
         await Gal.putImageBytes(out, name: 'edit_${_stamp()}');
-        _toast('已儲存到相簿');
+        _toast('已儲存到相簿$note');
       } else {
         final dir = await getApplicationDocumentsDirectory();
         final path = '${dir.path}${Platform.pathSeparator}edit_${_stamp()}.jpg';
         await File(path).writeAsBytes(out);
-        _toast('已儲存:$path');
+        _toast('已儲存:$path$note');
       }
     } catch (e) {
       _toast('儲存失敗:$e');
@@ -300,6 +340,10 @@ class _EditorPageState extends State<EditorPage> {
                                 : _preview!,
                             fit: BoxFit.contain,
                             gaplessPlayback: true,
+                            // 原尺寸結果可能上千萬像素,只解碼到螢幕寬度,省記憶體。
+                            cacheWidth: (MediaQuery.sizeOf(context).width *
+                                    MediaQuery.devicePixelRatioOf(context))
+                                .round(),
                           ),
                         ),
                       ),
@@ -434,6 +478,14 @@ class _EditorPageState extends State<EditorPage> {
     );
   }
 }
+
+// 背景 isolate 的入口放在頂層,閉包才不會帶到 State(含 BuildContext,無法傳到 isolate)。
+Future<PhotoResult> _processInBackground(Uint8List bytes, PhotoOptions opts) =>
+    Isolate.run(() => processPhoto(bytes, opts));
+
+Future<Uint8List> _renderInBackground(
+        Uint8List bytes, ColorMatrix matrix, double sharpen) =>
+    Isolate.run(() => _render(bytes, matrix, sharpen));
 
 /// 輸出:把色彩矩陣與銳化實際套用到像素上,回傳 JPG 位元組。
 Uint8List _render(Uint8List bytes, ColorMatrix m, double sharpen) {
