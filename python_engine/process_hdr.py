@@ -81,8 +81,9 @@ def main() -> int:
         else:
             budget, rot_budget, max_zoom = STABILIZE_LEVELS["strong" if STRONG else "standard"]
             corr = stabilize_path(motions, w, h, budget, rot_budget, smoothing_sigma(fps))
-            zoom = stabilization_zoom(corr, w, h, max_zoom=max_zoom)
             mode = "平滑"
+        # 最終倍率要把果凍修正的條帶偏移也算進去,才不會露邊
+        zoom = stabilization_zoom(corr, w, h, max_zoom=1.25 if locked is not None else max_zoom, rs=rs)
     print(f"晃動分數 {score:.2e}({'有晃動,套用防手震 ' + mode if shaky else '穩定,略過防手震'})  放大 {zoom:.3f}  "
           f"分析 {time.time() - t0:.0f}s", flush=True)
 

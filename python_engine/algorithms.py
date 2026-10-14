@@ -392,19 +392,27 @@ class DetailEnhancer:
         return np.clip(f + delta[..., None], 0, 255).astype(np.uint8)
 
 
-def stabilization_zoom(corrections: np.ndarray, w: int, h: int, max_zoom: float = 1.08) -> float:
-    """剛好蓋住修正後黑邊所需的放大倍率(取 99 百分位,避免單一極端值放大整支影片)。
+def stabilization_zoom(corrections: np.ndarray, w: int, h: int, max_zoom: float = 1.08,
+                       rs: np.ndarray | None = None) -> float:
+    """剛好讓每一格都蓋滿畫面的放大倍率(精確計算,所有影格取最大值)。
 
-    固定放大 5% 會無謂地損失解析度;晃動小的影片只需要放大 1~2%。
+    輸出像素 X 取樣自原影格 c + R(-θ)(X - c - d ± o) / zoom(o 為果凍修正的條帶偏移),
+    四個角落都要落在原影格內。舊做法取 99 百分位、且沒算果凍偏移,
+    約有 1~3% 的影格邊緣會露出被拉長的像素。
+    rs 為各格各條帶的果凍偏移 (n, bands, 2)。
     """
     if len(corrections) == 0:
         return 1.0
-    dx = np.percentile(np.abs(corrections[:, 0]), 99) / w
-    dy = np.percentile(np.abs(corrections[:, 1]), 99) / h
-    da = np.percentile(np.abs(corrections[:, 2]), 99)
-    # 平移每邊需要 2×位移比例;旋轉 θ 時角落外露約 θ×(長邊/短邊)。
-    need = 1.0 + 2.0 * max(dx, dy) + da * max(w, h) / min(w, h)
-    return float(np.clip(need, 1.0, max_zoom))
+    cx, cy = w / 2, h / 2
+    need = 1.0
+    for i, (dx, dy, da) in enumerate(corrections):
+        ox, oy = (np.abs(rs[i]).max(axis=0) if rs is not None else (0.0, 0.0))
+        c, s = np.cos(da), np.sin(da)
+        for vx in (-cx - dx - ox, -cx - dx + ox, cx - dx - ox, cx - dx + ox):
+            for vy in (-cy - dy - oy, -cy - dy + oy, cy - dy - oy, cy - dy + oy):
+                ux, uy = c * vx + s * vy, -s * vx + c * vy  # R(-θ) v
+                need = max(need, abs(ux) / cx, abs(uy) / cy)
+    return float(min(need, max_zoom))
 
 
 def lock_trajectory(motions: np.ndarray, w: int, h: int, max_zoom: float = 1.25

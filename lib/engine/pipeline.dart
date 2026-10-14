@@ -515,16 +515,16 @@ Future<VideoReport> processVideo(
         }
         // 鎖定需要的裁切太多(例如邊走邊拍)時,改用強力平滑。
         final lv = locked || level != StabilizeLevel.lock ? level : StabilizeLevel.strong;
-        if (smooth == null) {
-          smooth = stabilizePath(list, workW, workH,
-              budget: lv.budget, rotBudget: lv.rotBudget, sigma: smoothingSigma(info.fps));
-          zoom = stabilizationZoom(smooth, workW, workH, maxZoom: lv.maxZoom);
-        }
-        if (options.zoom > 0) zoom = options.zoom;
-        corrections = Float64List.fromList([for (final m in smooth) ...[m.dx, m.dy, m.da]]);
+        smooth ??= stabilizePath(list, workW, workH,
+            budget: lv.budget, rotBudget: lv.rotBudget, sigma: smoothingSigma(info.fps));
         // 果凍效應修正:高通的時間尺度約半秒(sigma = fps/2 格)。
-        rollingShutter = Float64List.fromList(
-            [for (final r in rollingShutterOffsets(residuals, info.fps / 2)) ...r]);
+        final rs = rollingShutterOffsets(residuals, info.fps / 2);
+        // 最終倍率要把果凍修正的條帶偏移也算進去,才不會露邊。
+        zoom = options.zoom > 0
+            ? options.zoom
+            : stabilizationZoom(smooth, workW, workH, maxZoom: lv.maxZoom, rs: rs);
+        corrections = Float64List.fromList([for (final m in smooth) ...[m.dx, m.dy, m.da]]);
+        rollingShutter = Float64List.fromList([for (final r in rs) ...r]);
         report = VideoReport(shakeScore: jitter, stabilized: true, zoom: zoom, locked: locked);
       }
     }

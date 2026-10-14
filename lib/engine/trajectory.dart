@@ -102,24 +102,35 @@ List<Motion> stabilizePath(List<Motion> motions, int w, int h,
   return [for (var i = 0; i < n; i++) Motion(path[0][i], path[1][i], path[2][i])];
 }
 
-/// 剛好蓋住修正後黑邊所需的放大倍率(取 99 百分位,避免單一極端值放大整支影片)。
-/// 固定放大 5% 會無謂地損失解析度;晃動小的影片只需要放大 1~2%。
+/// 剛好讓每一格都蓋滿畫面的放大倍率(精確計算,所有影格取最大值)。
+///
+/// 輸出像素 X 取樣自原影格 c + R(-θ)(X - c - d ± o) / zoom(o 為果凍修正的條帶偏移),
+/// 四個角落都要落在原影格內。舊做法取 99 百分位、且沒算果凍偏移,
+/// 約有 1~3% 的影格邊緣會露出被拉長的像素。
+/// [rs] 為各格的果凍偏移(見 [rollingShutterOffsets])。
 /// 對應 python_engine/algorithms.py 的 stabilization_zoom。
-double stabilizationZoom(List<Motion> c, int w, int h, {double maxZoom = 1.08}) {
-  if (c.isEmpty) return 1.0;
-  double p99(Iterable<double> v) {
-    final s = v.map((e) => e.abs()).toList()..sort();
-    final pos = 0.99 * (s.length - 1);
-    final lo = pos.floor(), hi = pos.ceil();
-    return s[lo] + (s[hi] - s[lo]) * (pos - lo);
+double stabilizationZoom(List<Motion> c, int w, int h,
+    {double maxZoom = 1.08, List<Float64List>? rs}) {
+  final cx = w / 2, cy = h / 2;
+  var need = 1.0;
+  for (var i = 0; i < c.length; i++) {
+    final m = c[i];
+    var ox = 0.0, oy = 0.0;
+    if (rs != null && i < rs.length) {
+      for (var b = 0; b + 1 < rs[i].length; b += 2) {
+        ox = math.max(ox, rs[i][b].abs());
+        oy = math.max(oy, rs[i][b + 1].abs());
+      }
+    }
+    final cs = math.cos(m.da), sn = math.sin(m.da);
+    for (final vx in [-cx - m.dx - ox, -cx - m.dx + ox, cx - m.dx - ox, cx - m.dx + ox]) {
+      for (final vy in [-cy - m.dy - oy, -cy - m.dy + oy, cy - m.dy - oy, cy - m.dy + oy]) {
+        final ux = cs * vx + sn * vy, uy = -sn * vx + cs * vy; // R(-θ) v
+        need = math.max(need, math.max(ux.abs() / cx, uy.abs() / cy));
+      }
+    }
   }
-
-  final dx = p99(c.map((m) => m.dx)) / w;
-  final dy = p99(c.map((m) => m.dy)) / h;
-  final da = p99(c.map((m) => m.da));
-  // 平移每邊需要 2×位移比例;旋轉 θ 時角落外露約 θ×(長邊/短邊)。
-  final need = 1.0 + 2.0 * math.max(dx, dy) + da * math.max(w, h) / math.min(w, h);
-  return need.clamp(1.0, maxZoom);
+  return math.min(need, maxZoom);
 }
 
 /// 解線性方程組 a x = b(高斯消去、部分選主元)。a、b 會被改寫。

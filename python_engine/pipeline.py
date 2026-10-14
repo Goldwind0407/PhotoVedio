@@ -87,8 +87,8 @@ def process_video(src: str, dst: str, opt: Options,
     if opt.stabilize:
         budget, rot_budget, max_zoom = STABILIZE_LEVELS[opt.stabilize_level]
         corrections = stabilize_path(motions, w, h, budget, rot_budget, smoothing_sigma(fps))
-        zoom = zoom or stabilization_zoom(corrections, w, h, max_zoom=max_zoom)
         rs = rolling_shutter_offsets(residuals, fps / 2)
+        zoom = zoom or stabilization_zoom(corrections, w, h, max_zoom=max_zoom, rs=rs)
 
     have_ffmpeg = shutil.which("ffmpeg") is not None
     tmp_video = Path(tempfile.mkdtemp()) / "video_only.mp4" if have_ffmpeg else Path(dst)
