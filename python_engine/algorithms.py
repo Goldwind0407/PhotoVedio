@@ -198,6 +198,7 @@ def _gauss_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
 STABILIZE_LEVELS = {
     "standard": (0.03, 0.02, 1.12),
     "strong": (0.05, 0.03, 1.20),
+    "extreme": (0.08, 0.04, 1.30),  # 晃動很大或跟拍時用
 }
 
 

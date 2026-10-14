@@ -26,10 +26,15 @@
   - 依雜訊強度增強細節，平坦區（皮膚、牆面）不放大顆粒。
   - 濾波範圍會跟著解析度放大，4K 影片在手機上看也看得出效果。
 - **除霧**：只在有明顯霧氣時使用，否則會改變原片色調。
+- **AI 放大到 4K**（Real-ESRGAN）：放大 4 倍後縮到長邊 3840，補出細節、清掉壓縮雜訊，適合解析度低或被通訊軟體壓縮過的影片。
+  - 非常耗運算：每個輸入像素約 240 萬次浮點運算，592×1280 的影格約 1.8 TFLOP。手機上會優先用 GPU/NPU（Android NNAPI、iPhone CoreML），不支援時退回 CPU。
+  - 實測（4 核心 CPU、onnxruntime）：592×1280 每格約 11 秒。有獨立顯示卡的電腦會快很多，長影片建議用電腦版。
+  - 開啟時取代「提高畫質」；皮膚等平滑區域會被抹得比較乾淨。
 - **防手震**
   - **標準**：畫面裁切約 5～10%。
   - **強**：適合走路拍攝，裁切約 10～16%。
-  - **鎖定**：像架在腳架上，完全不晃；需要裁切太多時自動改用「強」。
+  - **超強**：晃動很大或跟拍時用，裁切約 18～25%。
+  - **鎖定**：像架在腳架上，完全不晃；需要裁切太多時自動改用「超強」。
   - 會自動偵測晃動程度，畫面本來就很穩定時不處理。處理完會告訴你實際做了什麼、裁切了多少。
   - **含果凍效應修正**：見下方〈演算法說明〉。
 - **HDR 影片**：iPhone 錄的 HLG／PQ 影片會輸出 10-bit HEVC，並保留色彩標註，播放時不會偏暗或變色。
@@ -70,6 +75,12 @@
 | 原片 | 3.6px | 3.6px |
 | 處理後 | 0.38px | 0.38px |
 
+### AI 超解析度
+- 模型：Real-ESRGAN `realesr-general-x4v3`（SRVGGNetCompact，120 萬參數，BSD 3-Clause，授權見 `assets/models/LICENSE-Real-ESRGAN.txt`）。
+- `python_engine/convert_sr_model.py` 不需要 PyTorch 就能把官方 `.pth` 權重轉成 ONNX；轉好的模型放在 `assets/models/`，App 與電腦版共用。
+- 大畫面分塊處理，每塊多取 40 像素重疊（大於網路的作用範圍），結果與整張處理完全相同。
+- App（Dart，onnxruntime）與電腦版（Python）的輸出最大差 1 個灰階（四捨五入誤差）。
+
 ### 提高畫質
 - 用自導向濾波把亮度拆成「基底 + 中尺度細節 + 細尺度細節」，邊緣不會出現光暈。
 - 依估計的雜訊強度做軟閾值：雜訊不放大，雜訊明顯時順便降噪。
@@ -94,6 +105,8 @@ lib/
     algorithms.dart      影像演算法(運動估計、除霧、提高畫質、色調錨定、套用防手震)
     trajectory.dart      鏡頭路徑計算(平滑、鎖定、果凍偏移;純 Dart,不依賴 OpenCV)
     photo.dart           照片的除霧/提高畫質
+    superres.dart        AI 超解析度(onnxruntime)
+assets/models/           AI 超解析度模型與授權
   smoke_main.dart        實機驗證用入口(影片)
   photo_smoke_main.dart  實機驗證用入口(照片)
 test/                    單元測試
@@ -110,7 +123,8 @@ python_engine/           電腦版演算法與驗證工具(與 lib/engine 逐函
 flutter pub get
 flutter run            # 連接手機後執行
 flutter analyze
-flutter test
+# test/superres_test.dart 需要 onnxruntime 原生函式庫(套件內附 Linux 版):
+LD_LIBRARY_PATH=~/.pub-cache/hosted/pub.dev/onnxruntime-1.4.1/linux flutter test
 ```
 
 - 影片處理使用 `ffmpeg_kit_min_gpl`，支援 Android、iOS、macOS。
@@ -120,13 +134,15 @@ flutter test
 ## 電腦版（python_engine）
 
 ```bash
-pip install opencv-python numpy imageio-ffmpeg
+pip install opencv-python numpy imageio-ffmpeg onnxruntime   # 有 NVIDIA 顯示卡可改裝 onnxruntime-gpu
 cd python_engine
 
 # 和 App 相同的完整流程(原生解析度、支援 HDR)
 python process_hdr.py 原片.mp4 輸出.mp4              # 標準防手震
 python process_hdr.py 原片.mp4 輸出.mp4 --strong     # 強力防手震
+python process_hdr.py 原片.mp4 輸出.mp4 --extreme    # 超強防手震
 python process_hdr.py 原片.mp4 輸出.mp4 --lock       # 鏡頭鎖定
+python process_hdr.py 原片.mp4 輸出.mp4 --extreme --sr   # 加上 AI 放大到 4K(長邊 3840,可指定:--sr 2560)
 
 # 自選處理項目
 python cli.py 原片.mp4 輸出.mp4 --stabilize --stabilize-level strong --enhance --enhance-level high --dehaze

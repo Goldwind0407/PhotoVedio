@@ -14,7 +14,7 @@ def main() -> int:
     p.add_argument("--dehaze", action="store_true", help="暗通道先驗除霧")
     p.add_argument("--dehaze-strength", type=float, default=0.6)
     p.add_argument("--stabilize", action="store_true", help="防手震(含果凍效應修正)")
-    p.add_argument("--stabilize-level", choices=["standard", "strong"], default="standard")
+    p.add_argument("--stabilize-level", choices=["standard", "strong", "extreme"], default="standard")
     p.add_argument("--zoom", type=float, default=0, help="防手震裁切放大倍率;0 = 自動")
     a = p.parse_args()
 

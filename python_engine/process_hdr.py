@@ -4,7 +4,8 @@
   2. FFmpeg 解碼原尺寸 → (防手震)→ 提高畫質(DetailEnhancer)→ FFmpeg 編碼
   3. HDR 原片輸出 10-bit HEVC 並保留 HLG/BT.2020 標註;原音軌直接複製
 
-用法:python process_hdr.py 原片.mp4 輸出.mp4 [--strong | --lock]
+用法:python process_hdr.py 原片.mp4 輸出.mp4 [--strong | --extreme | --lock] [--sr [長邊像素]]
+  --sr:AI 超解析度放大(預設輸出長邊 3840,即 4K),取代 DetailEnhancer。需要 onnxruntime 或 OpenCV。
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import time
 
+import cv2
 import numpy as np
 
 from algorithms import DetailEnhancer
@@ -23,7 +25,7 @@ from roundtrip import FFMPEG, probe
 ANALYSIS_LONG_SIDE = 1280
 SHAKE_THRESHOLD = 0.4e-3  # 與 App 相同:高頻抖動 / 畫面長邊
 LOCK = False  # --lock:三腳架鎖定模式(完全無晃動,裁切較多)
-STRONG = False  # --strong:強力防手震(裁切較多)
+LEVEL = "standard"  # --strong / --extreme:更強的防手震(裁切較多)
 ACC = "accurate_rnd+full_chroma_int+full_chroma_inp"
 
 
@@ -61,9 +63,15 @@ def analyze(src: str, w: int, h: int, matrix: str) -> tuple[np.ndarray, np.ndarr
 
 def main() -> int:
     src, dst = sys.argv[1:3]
-    global LOCK, STRONG
-    LOCK = "--lock" in sys.argv[3:]
-    STRONG = LOCK or "--strong" in sys.argv[3:]
+    global LOCK, LEVEL
+    flags = sys.argv[3:]
+    sr_long = 0
+    if "--sr" in flags:
+        nxt = flags[flags.index("--sr") + 1:flags.index("--sr") + 2]
+        sr_long = int(nxt[0]) if nxt and nxt[0].isdigit() else 3840
+    LOCK = "--lock" in flags
+    # 鎖定需要的裁切太多時改用超強平滑
+    LEVEL = "extreme" if LOCK or "--extreme" in flags else ("strong" if "--strong" in flags else "standard")
     w, h, fps, hdr = probe(src)
     m = "bt2020" if hdr else "bt709"
     t0 = time.time()
@@ -79,7 +87,7 @@ def main() -> int:
             corr, zoom, deg = locked
             mode = ["鎖定:固定鏡頭", "鎖定:等速運鏡", "鎖定:二次曲線運鏡", "鎖定:三次曲線運鏡"][deg]
         else:
-            budget, rot_budget, max_zoom = STABILIZE_LEVELS["strong" if STRONG else "standard"]
+            budget, rot_budget, max_zoom = STABILIZE_LEVELS[LEVEL]
             corr = stabilize_path(motions, w, h, budget, rot_budget, smoothing_sigma(fps))
             mode = "平滑"
         # 最終倍率要把果凍修正的條帶偏移也算進去,才不會露邊
@@ -97,11 +105,18 @@ def main() -> int:
     dec = subprocess.Popen([FFMPEG, "-v", "error", "-i", src, "-an",
                             "-vf", f"scale={w}:{h}:in_color_matrix={m}:in_range=tv:flags={ACC}",
                             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], stdout=subprocess.PIPE)
-    enc = subprocess.Popen([FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+    sr = None
+    ow, oh = w, h
+    if sr_long:
+        from superres import SuperResolver, target_size
+        sr = SuperResolver()
+        ow, oh = target_size(w, h, sr_long)
+        print(f"AI 超解析度:{w}x{h} → {ow}x{oh}({sr.backend})", flush=True)
+    enc = subprocess.Popen([FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{ow}x{oh}",
                             "-framerate", f"{fps}", "-i", "-", "-i", src, "-map", "0:v:0", "-map", "1:a:0?",
                             *codec, "-color_range", "tv", "-c:a", "copy", "-shortest",
                             "-movflags", "+faststart", dst], stdin=subprocess.PIPE)
-    enhancer = DetailEnhancer()
+    enhancer = None if sr else DetailEnhancer()
     size, i, total = w * h * 3, 0, len(motions)
     while True:
         buf = dec.stdout.read(size)
@@ -110,10 +125,16 @@ def main() -> int:
         f = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
         if corr is not None and i < len(corr):
             f = apply_stabilization(f, corr[i], zoom, rs[i])
-        f = enhancer(f)
+        if sr is not None:
+            # AI 放大 4 倍後縮到目標尺寸(INTER_AREA 縮小不會產生鋸齒)
+            f = sr(f)
+            if f.shape[1] != ow or f.shape[0] != oh:
+                f = cv2.resize(f, (ow, oh), interpolation=cv2.INTER_AREA)
+        else:
+            f = enhancer(f)
         enc.stdin.write(np.ascontiguousarray(f).tobytes())
         i += 1
-        if i % 60 == 0:
+        if i % (5 if sr else 60) == 0:
             print(f"  {i}/{total} 格  {time.time() - t0:.0f}s", flush=True)
     enc.stdin.close()
     enc.wait()

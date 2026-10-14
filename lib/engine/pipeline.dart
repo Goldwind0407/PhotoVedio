@@ -22,6 +22,7 @@ import 'package:ffmpeg_kit_min_gpl/return_code.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 import 'algorithms.dart';
+import 'superres.dart';
 
 class EngineOptions {
   const EngineOptions({
@@ -38,6 +39,9 @@ class EngineOptions {
     this.maxFrames = 0,
     this.shakeThreshold = 0.4e-3,
     this.maxLongSide = 0,
+    this.superRes = false,
+    this.srLongSide = 3840,
+    this.srModel,
   });
 
   final bool enhance; // 提高畫質:雜訊感知、邊緣感知的亮度細節增強(DetailEnhancer)
@@ -57,20 +61,36 @@ class EngineOptions {
   // 工作解析度上限(長邊像素)。4K 單格 BGR 就 25 MB、浮點中間結果更大,
   // 手機記憶體撐不住,所以解碼時就先縮小。0 = 保持原尺寸。
   final int maxLongSide;
+  // AI 超解析度:放大 4 倍後縮到長邊 [srLongSide](3840 = 4K)。開啟時取代 [enhance]。
+  // [srModel] 為 ONNX 模型內容(見 superres.dart 的 srModelAsset)。
+  final bool superRes;
+  final int srLongSide;
+  final Uint8List? srModel;
 
-  bool get any => enhance || dehaze || stabilize;
+  bool get any => enhance || dehaze || stabilize || superRes;
 }
 
 typedef ProgressCallback = void Function(String stage, double fraction);
 
 /// 處理結果摘要,讓畫面告訴使用者防手震實際做了什麼。
 class VideoReport {
-  const VideoReport({this.shakeScore, this.stabilized = false, this.zoom = 1.0, this.locked = false});
+  const VideoReport({
+    this.shakeScore,
+    this.stabilized = false,
+    this.zoom = 1.0,
+    this.locked = false,
+    this.outWidth = 0,
+    this.outHeight = 0,
+  });
 
   final double? shakeScore; // null = 沒開防手震
   final bool stabilized; // false = 偵測為穩定而略過
   final double zoom; // 防手震的放大倍率
   final bool locked; // 用了三腳架鎖定
+  final int outWidth, outHeight; // 輸出影片尺寸
+
+  VideoReport withSize(int w, int h) => VideoReport(
+      shakeScore: shakeScore, stabilized: stabilized, zoom: zoom, locked: locked, outWidth: w, outHeight: h);
 }
 
 /// 晃動分數:軌跡偏離其移動平均(視窗 15 格)的平均距離,除以畫面長邊。
@@ -362,12 +382,15 @@ void _renderEntry((Object, SendPort) args) {
   final o = job.options;
   Dehazer? dehazer;
   ToneAnchor? anchor;
+  SuperResolver? sr;
   try {
     final fin = File(job.inPipe).openSync();
     final fout = File(job.outPipe).openSync(mode: FileMode.writeOnly);
     // 新版畫質增強不改變色調;只有除霧會改變亮度分佈,才需要錨定回原片。
     anchor = o.toneAnchor && o.dehaze ? ToneAnchor(chroma: o.anchorChroma) : null;
-    final enhancer = o.enhance
+    sr = o.superRes ? SuperResolver(o.srModel!) : null;
+    // AI 放大本身就會補細節、讓邊緣銳利,再疊細節增強反而過頭,所以兩者擇一。
+    final enhancer = o.enhance && sr == null
         ? DetailEnhancer.level(o.enhanceLevel)
         : null;
     dehazer = o.dehaze ? Dehazer(strength: o.dehazeStrength, chroma: o.dehazeChroma) : null;
@@ -395,8 +418,12 @@ void _renderEntry((Object, SendPort) args) {
       final ref = anchor != null ? cur.clone() : null;
       if (dehazer != null) step(dehazer(cur));
       if (enhancer != null) step(enhancer(cur));
+      if (sr != null) step(sr(cur));
       if (cur.cols != job.outW || cur.rows != job.outH) {
-        step(cv.resize(cur, (job.outW, job.outH), interpolation: cv.INTER_LANCZOS4));
+        // AI 放大 4 倍後縮到目標尺寸用 INTER_AREA(縮小不產生鋸齒);其餘放大用 Lanczos。
+        final shrink = cur.cols > job.outW;
+        step(cv.resize(cur, (job.outW, job.outH),
+            interpolation: shrink ? cv.INTER_AREA : cv.INTER_LANCZOS4));
       }
       if (ref != null) {
         // 開「放大」時輸出比參照圖大,參照圖也要放大到相同尺寸。
@@ -409,7 +436,10 @@ void _renderEntry((Object, SendPort) args) {
       }
       fout.writeFromSync(cur.data);
       if (!identical(cur, frame)) cur.dispose();
-      if (i % 5 == 0) port.send(_Progress('輸出影片', i / job.frames));
+      // AI 放大每格要好幾秒,每格都回報進度
+      if (sr != null || i % 5 == 0) {
+        port.send(_Progress(sr != null ? '輸出影片(AI 放大)' : '輸出影片', (i + 1) / job.frames));
+      }
     }
     fin.closeSync();
     fout.closeSync(); // 關閉寫入端 → 編碼器讀到 EOF 後收尾
@@ -418,6 +448,7 @@ void _renderEntry((Object, SendPort) args) {
   } catch (e) {
     port.send(_Failure('$e'));
   } finally {
+    sr?.release();
     dehazer?.dispose();
   }
 }
@@ -513,8 +544,8 @@ Future<VideoReport> processVideo(
             locked = true;
           }
         }
-        // 鎖定需要的裁切太多(例如邊走邊拍)時,改用強力平滑。
-        final lv = locked || level != StabilizeLevel.lock ? level : StabilizeLevel.strong;
+        // 鎖定需要的裁切太多(例如邊走邊拍)時,改用超強平滑。
+        final lv = locked || level != StabilizeLevel.lock ? level : StabilizeLevel.extreme;
         smooth ??= stabilizePath(list, workW, workH,
             budget: lv.budget, rotBudget: lv.rotBudget, sigma: smoothingSigma(info.fps));
         // 果凍效應修正:高通的時間尺度約半秒(sigma = fps/2 格)。
@@ -531,7 +562,8 @@ Future<VideoReport> processVideo(
 
     _checkCancelled();
     // ---- 階段 2:解碼 → OpenCV → 編碼 ----
-    final outW = workW, outH = workH;
+    final (outW, outH) =
+        options.superRes ? srTargetSize(workW, workH, options.srLongSide) : (workW, workH);
     final inPipe = await newPipe();
     final outPipe = await newPipe();
     var finished = false;
@@ -600,7 +632,7 @@ Future<VideoReport> processVideo(
     if (!ReturnCode.isSuccess(enc)) {
       throw Exception('編碼失敗:$_lastFfmpegError');
     }
-    return report;
+    return report.withSize(outW, outH);
   } catch (_) {
     // 取消後各階段會因管道中斷而各自報錯,統一成「已取消」,並刪掉不完整的輸出檔。
     try {

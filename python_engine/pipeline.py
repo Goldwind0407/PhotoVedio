@@ -24,7 +24,7 @@ class Options:
     dehaze_strength: float = 0.6
     tone_anchor: bool = True    # 最後把亮度/色彩拉回原片
     stabilize: bool = False
-    stabilize_level: str = "standard"  # standard / strong(裁切較多、更穩)
+    stabilize_level: str = "standard"  # standard / strong / extreme(裁切越多越穩)
     zoom: float = 0             # 防手震裁切放大;0 = 依修正量自動計算
 
 

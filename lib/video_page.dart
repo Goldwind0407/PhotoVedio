@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -8,6 +9,7 @@ import 'package:video_player/video_player.dart';
 
 import 'engine/algorithms.dart' show EnhanceLevel, StabilizeLevel;
 import 'engine/pipeline.dart';
+import 'engine/superres.dart' show srModelAsset;
 
 /// 影片修復頁:防手震、提高畫質、除霧。處理完成後可比較原片、再存到相簿。
 class VideoPage extends StatefulWidget {
@@ -36,6 +38,7 @@ class _VideoPageState extends State<VideoPage> {
   EnhanceLevel _enhanceLevel = EnhanceLevel.medium;
   bool _dehaze = false;
   double _dehazeStrength = 0.6; // 0 ~ 1
+  bool _superRes = false; // AI 放大到 4K
 
   bool _busy = false;
   bool _cancelling = false;
@@ -161,7 +164,7 @@ class _VideoPageState extends State<VideoPage> {
     final src = _sourcePath;
     final player = _player;
     if (src == null || player == null) return;
-    if (!_enhance && !_dehaze && !_stabilize) {
+    if (!_enhance && !_dehaze && !_stabilize && !_superRes) {
       _toast('請至少開啟一項處理');
       return;
     }
@@ -180,10 +183,14 @@ class _VideoPageState extends State<VideoPage> {
       if (_enhance) '提高畫質(${_enhanceLevel.name})',
       if (_dehaze) '除霧',
       if (_stabilize) '防手震(${_stabilizeLevel.name})',
+      if (_superRes) 'AI 放大',
     ].join('、');
     _lastLogged = '';
     _logProgress('準備中', '影片:$settings\n停在:準備中');
     try {
+      final model = _superRes
+          ? (await rootBundle.load(srModelAsset)).buffer.asUint8List()
+          : null;
       final dir = await getTemporaryDirectory();
       final stamp = DateTime.now().millisecondsSinceEpoch;
       final out = '${dir.path}/fixed_$stamp.mp4';
@@ -197,6 +204,8 @@ class _VideoPageState extends State<VideoPage> {
           dehazeStrength: _dehazeStrength,
           stabilize: _stabilize,
           stabilizeLevel: _stabilizeLevel,
+          superRes: _superRes,
+          srModel: model,
         ),
         onProgress: (stage, p) {
           final at = '$stage ${(p * 50).floor() * 2}%';
@@ -241,10 +250,17 @@ class _VideoPageState extends State<VideoPage> {
   }
 
   String? _describe(VideoReport r) {
-    if (r.shakeScore == null) return null;
-    if (!r.stabilized) return '畫面本來就很穩定,沒有套用防手震';
-    final crop = ((1 - 1 / r.zoom) * 100).round();
-    return '${r.locked ? '已鎖定鏡頭' : '已套用防手震'},畫面裁切約 $crop%';
+    final notes = <String>[];
+    if (r.shakeScore != null) {
+      if (!r.stabilized) {
+        notes.add('畫面本來就很穩定,沒有套用防手震');
+      } else {
+        final crop = ((1 - 1 / r.zoom) * 100).round();
+        notes.add('${r.locked ? '已鎖定鏡頭' : '已套用防手震'},畫面裁切約 $crop%');
+      }
+    }
+    if (_superRes && r.outWidth > 0) notes.add('AI 放大為 ${r.outWidth}×${r.outHeight}');
+    return notes.isEmpty ? null : notes.join(';');
   }
 
   Future<void> _save() async {
@@ -540,6 +556,7 @@ class _VideoPageState extends State<VideoPage> {
                   subtitle: switch (_stabilizeLevel) {
                     StabilizeLevel.standard => '含果凍修正,畫面裁切約 5~10%',
                     StabilizeLevel.strong => '適合走路拍攝,裁切約 10~16%',
+                    StabilizeLevel.extreme => '晃很大或跟拍時用,裁切約 18~25%',
                     StabilizeLevel.lock => '像架在腳架上完全不晃,裁切最多',
                   },
                   value: _stabilize,
@@ -549,12 +566,26 @@ class _VideoPageState extends State<VideoPage> {
                     options: const {
                       StabilizeLevel.standard: '標準',
                       StabilizeLevel.strong: '強',
+                      StabilizeLevel.extreme: '超強',
                       StabilizeLevel.lock: '鎖定',
                     },
                     onChanged: (v) => setState(() => _stabilizeLevel = v),
                   ),
                 ),
                 _OptionTile(
+                  icon: Icons.hd_outlined,
+                  title: 'AI 放大到 4K',
+                  subtitle: '補出細節、讓畫面更清楚;非常耗時',
+                  value: _superRes,
+                  onChanged: (v) => setState(() => _superRes = v),
+                  child: Text(
+                    '每一格都要經過 AI 運算,手機上每秒影片可能要好幾分鐘(依手機效能而定)。'
+                    '處理時會顯示預估剩餘時間,隨時可以取消。開啟時會取代「提高畫質」。',
+                    style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                  ),
+                ),
+                if (!_superRes)
+                  _OptionTile(
                   icon: Icons.auto_awesome,
                   title: '提高畫質',
                   subtitle: '增強紋理與輪廓,不改變色彩',
