@@ -11,7 +11,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from algorithms import (RS_BANDS, STABILIZE_LEVELS, Dehazer, DetailEnhancer, ToneAnchor, compression_level,
+from algorithms import (FILL_LEVELS, RS_BANDS, STABILIZE_LEVELS, fill_borders, fill_zoom, Dehazer, DetailEnhancer, ToneAnchor, compression_level,
                         apply_stabilization, estimate_motion_bands, rolling_shutter_offsets,
                         smoothing_sigma, stabilization_zoom, stabilize_path)
 
@@ -24,7 +24,8 @@ class Options:
     dehaze_strength: float = 0.6
     tone_anchor: bool = True    # 最後把亮度/色彩拉回原片
     stabilize: bool = False
-    stabilize_level: str = "standard"  # standard / strong / extreme(裁切越多越穩)
+    stabilize_level: str = "standard"  # standard / strong / extreme(越強越穩)
+    fill: bool = True           # 補邊:露出的邊緣用前後格補,只需少量放大
     zoom: float = 0             # 防手震裁切放大;0 = 依修正量自動計算
 
 
@@ -86,9 +87,17 @@ def process_video(src: str, dst: str, opt: Options,
     zoom = opt.zoom
     if opt.stabilize:
         budget, rot_budget, max_zoom = STABILIZE_LEVELS[opt.stabilize_level]
+        if opt.fill:
+            (budget, rot_budget), max_zoom = FILL_LEVELS[opt.stabilize_level], 3.0
         corrections = stabilize_path(motions, w, h, budget, rot_budget, smoothing_sigma(fps))
         rs = rolling_shutter_offsets(residuals, fps / 2)
         zoom = zoom or stabilization_zoom(corrections, w, h, max_zoom=max_zoom, rs=rs)
+        if opt.fill and not opt.zoom:
+            zoom = fill_zoom(zoom)
+    use_fill = opt.stabilize and opt.fill
+    win = max(2, min(15, int(400e6 / (w * h * 3) / 2))) if use_fill else 0
+    traj = np.cumsum(motions, axis=0) if opt.stabilize else None
+    path = traj + corrections if opt.stabilize else None
 
     have_ffmpeg = shutil.which("ffmpeg") is not None
     tmp_video = Path(tempfile.mkdtemp()) / "video_only.mp4" if have_ffmpeg else Path(dst)
@@ -104,13 +113,26 @@ def process_video(src: str, dst: str, opt: Options,
         from roundtrip import bitrate_info
         bitrate, hevc = bitrate_info(src)
         enhancer = DetailEnhancer.level(opt.enhance_level, compression_level(bitrate, w, h, fps, hevc))
-    i = 0
+    i, buf, eof = 0, {}, False
     while True:
-        ok, frame = cap.read()
-        if not ok:
+        # 補邊要用到前後 win 格:先多讀進緩衝區
+        while not eof and (not buf or max(buf) < i + win):
+            ok, f = cap.read()
+            if not ok:
+                eof = True
+                break
+            buf[(max(buf) + 1) if buf else 0] = f
+        if i not in buf:
             break
+        for j in [j for j in buf if j < i - win]:
+            del buf[j]
+        frame = buf[i]
         if corrections is not None and i < len(corrections):
-            frame = apply_stabilization(frame, corrections[i], zoom, rs[i])
+            if use_fill:
+                frame, cov = apply_stabilization(frame, corrections[i], zoom, rs[i], coverage=True)
+                fill_borders(frame, cov, i, buf, path, traj, zoom)
+            else:
+                frame = apply_stabilization(frame, corrections[i], zoom, rs[i])
         ref = frame if anchor else None
         if dehazer:
             frame = dehazer(frame)

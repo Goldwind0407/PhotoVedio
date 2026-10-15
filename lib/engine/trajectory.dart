@@ -11,22 +11,75 @@ class Motion {
 }
 
 /// 防手震強度。
+///
+/// [budget]、[rotBudget]、[maxZoom]:不補邊時(放大到完全蓋住)的修正上限與放大上限。
+/// [fillBudget]、[fillRotBudget]:補邊時的修正上限。露出的邊緣由前後格補,不必靠放大蓋住,
+/// 所以可以修得更多。以一段 42 秒手持跟拍實測殘餘晃動:5% 4.95px、8% 3.59px、16% 1.43px
+/// (不補邊的 8% 要放大 1.23 倍,補邊的 16% 只放大約 1.11 倍)。對應 algorithms.py 的 FILL_LEVELS。
 enum StabilizeLevel {
-  /// 每邊最多修正 3%、旋轉 0.02 rad,約放大 6~10%。
-  standard(0.03, 0.02, 1.12),
+  standard(0.03, 0.02, 1.12, 0.05, 0.025),
+  strong(0.05, 0.03, 1.20, 0.08, 0.04),
 
-  /// 每邊最多修正 5%、旋轉 0.03 rad,約放大 10~16%,大幅晃動(走路)時明顯更穩。
-  strong(0.05, 0.03, 1.20),
-
-  /// 每邊最多修正 8%、旋轉 0.04 rad,約放大 18~25%。晃動很大(邊走邊拍、跟拍)時用;
-  /// 實測一段手持跟拍:殘餘抖動 6.3px(標準)→ 3.6px。
-  extreme(0.08, 0.04, 1.30),
+  /// 晃動很大(邊走邊拍、跟拍)時用。
+  extreme(0.08, 0.04, 1.30, 0.16, 0.08),
 
   /// 三腳架鎖定:鏡頭路徑換成完全平滑的曲線;放大超過上限時改用 [extreme]。
-  lock(0.05, 0.03, 1.25);
+  lock(0.05, 0.03, 1.25, 0.16, 0.08);
 
-  const StabilizeLevel(this.budget, this.rotBudget, this.maxZoom);
+  const StabilizeLevel(this.budget, this.rotBudget, this.maxZoom, this.fillBudget, this.fillRotBudget);
   final double budget, rotBudget, maxZoom;
+  final double fillBudget, fillRotBudget;
+}
+
+/// 補邊時的放大倍率:原本需要的放大只用約三成,其餘七成露出的邊緣用前後格補。
+/// 對應 python_engine/algorithms.py 的 fill_zoom。
+double fillZoom(double fullZoom) => math.max(1.0, 1.0 + 0.3 * (fullZoom - 1.0));
+
+/// 露邊區域的四條外框帶 (x, y, 寬, 高):只對這些地方找前後格,省下九成以上的運算。
+/// [covered] 為覆蓋遮罩(非 0 = 有取到原影格),逐列排列 w×h。
+/// 對應 python_engine/algorithms.py 的 _border_bands。
+List<(int, int, int, int)> borderBands(Uint8List covered, int w, int h) {
+  var any = false;
+  for (var i = 0; i < covered.length; i++) {
+    if (covered[i] == 0) {
+      any = true;
+      break;
+    }
+  }
+  if (!any) return const [];
+  // 每一行(列)從邊緣算起連續露邊的長度,取最大。
+  // 先算左右帶(整條邊露出時,左右帶就是整欄),上下帶只看中間的欄,避免退化成整張畫面。
+  var t = 0, b = 0, l = 0, r = 0;
+  for (var y = 0; y < h; y++) {
+    var x = 0;
+    while (x < w && covered[y * w + x] == 0) {
+      x++;
+    }
+    if (x > l) l = x;
+    x = 0;
+    while (x < w && covered[y * w + (w - 1 - x)] == 0) {
+      x++;
+    }
+    if (x > r) r = x;
+  }
+  for (var x = l; x < w - r; x++) {
+    var y = 0;
+    while (y < h && covered[y * w + x] == 0) {
+      y++;
+    }
+    if (y > t) t = y;
+    y = 0;
+    while (y < h && covered[(h - 1 - y) * w + x] == 0) {
+      y++;
+    }
+    if (y > b) b = y;
+  }
+  return [
+    (0, 0, l, h),
+    (w - r, 0, r, h),
+    (l, 0, w - l - r, t),
+    (l, h - b, w - l - r, b),
+  ].where((e) => e.$3 > 0 && e.$4 > 0).toList();
 }
 
 /// numpy 'reflect' 邊界(鏡射但不重複邊緣點)。

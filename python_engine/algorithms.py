@@ -201,6 +201,15 @@ STABILIZE_LEVELS = {
     "extreme": (0.08, 0.04, 1.30),  # 晃動很大或跟拍時用
 }
 
+# 補邊模式的修正上限(每邊比例, 旋轉 rad):露出的邊緣由前後格補,不必靠放大蓋住,所以可以修得更多。
+# 以一段 42 秒手持跟拍實測殘餘晃動:5% 4.95px、8% 3.59px、16% 1.43px(不補邊的 8% 要放大 1.23 倍,
+# 補邊的 16% 只放大約 1.11 倍)。
+FILL_LEVELS = {
+    "standard": (0.05, 0.025),
+    "strong": (0.08, 0.04),
+    "extreme": (0.16, 0.08),
+}
+
 
 def smoothing_sigma(fps: float) -> float:
     """平滑時間尺度約 0.27 秒,不隨幀率改變。"""
@@ -243,36 +252,111 @@ def rolling_shutter_offsets(residuals: np.ndarray, sigma: float) -> np.ndarray:
     return (pos - _gauss_smooth(pos, sigma)).reshape(n, bands, 2)
 
 
+def _stab_matrix(w: int, h: int, correction, zoom: float) -> np.ndarray:
+    dx, dy, da = correction
+    c, s = np.cos(da) * zoom, np.sin(da) * zoom
+    cx, cy = w / 2, h / 2
+    return np.array([[c, -s, cx - c * cx + s * cy + dx],
+                     [s, c, cy - s * cx - c * cy + dy]], dtype=np.float64)
+
+
 def apply_stabilization(frame: np.ndarray, correction: np.ndarray, zoom: float,
-                        rs: np.ndarray | None = None, strip: int = 16) -> np.ndarray:
+                        rs: np.ndarray | None = None, strip: int = 16, coverage: bool = False):
     """套用補償量並放大 zoom 倍以裁掉黑邊(以影格中心為軸)。
 
     rs 為各條帶的果凍偏移 (bands, 2):分條帶(每 strip 列)各自多平移 -偏移,
     偏移在條帶中心之間線性內插,條帶交界不會有斷層。
+    coverage=True 時另外回傳覆蓋遮罩(uint8,1 = 這個輸出像素有取到原影格,0 = 露邊),給補邊用。
     """
     h, w = frame.shape[:2]
-    dx, dy, da = correction
-    c, s = np.cos(da) * zoom, np.sin(da) * zoom
-    cx, cy = w / 2, h / 2
-    m = np.array([[c, -s, cx - c * cx + s * cy + dx],
-                  [s, c, cy - s * cx - c * cy + dy]], dtype=np.float64)
+    m = _stab_matrix(w, h, correction, zoom)
+    cy = h / 2
+    ones = np.ones((h, w), np.uint8) if coverage else None
     # Lanczos 取樣:雙線性在放大時會把細節抹掉約三成,Lanczos 只損失約一成。
     if rs is None or not np.any(rs):
-        return cv2.warpAffine(frame, m.astype(np.float32), (w, h), flags=cv2.INTER_LANCZOS4,
-                              borderMode=cv2.BORDER_REPLICATE)
+        out = cv2.warpAffine(frame, m.astype(np.float32), (w, h), flags=cv2.INTER_LANCZOS4,
+                             borderMode=cv2.BORDER_REPLICATE)
+        if not coverage:
+            return out
+        return out, cv2.warpAffine(ones, m.astype(np.float32), (w, h), flags=cv2.INTER_NEAREST)
     bands = len(rs)
     centers = (np.arange(bands) + 0.5) * h / bands
     out = np.empty_like(frame)
+    cov = np.empty((h, w), np.uint8) if coverage else None
     for y0 in range(0, h, strip):
         hs = min(strip, h - y0)
         # 輸出列對應的原影格列(忽略微小旋轉):果凍偏移是按原影格的列量測的。
-        yc = cy + (y0 + hs / 2 - cy - dy) / zoom
+        yc = cy + (y0 + hs / 2 - cy - correction[1]) / zoom
         ms = m.copy()
         ms[0, 2] -= np.interp(yc, centers, rs[:, 0])
         ms[1, 2] -= np.interp(yc, centers, rs[:, 1]) + y0
         out[y0:y0 + hs] = cv2.warpAffine(frame, ms.astype(np.float32), (w, hs),
                                          flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
-    return out
+        if coverage:
+            cov[y0:y0 + hs] = cv2.warpAffine(ones, ms.astype(np.float32), (w, hs), flags=cv2.INTER_NEAREST)
+    return (out, cov) if coverage else out
+
+
+def fill_zoom(full_zoom: float) -> float:
+    """補邊時的放大倍率:原本需要的放大只用約三成,其餘七成露出的邊緣用前後格補。
+    在一段晃動很大的手持跟拍實測:放大 1.17 → 1.05,背景殘餘晃動 7.3 → 1.0~1.4px,
+    露邊像素平均 3~4%,其中 99% 以上補得到。"""
+    return max(1.0, 1.0 + 0.3 * (full_zoom - 1.0))
+
+
+def _border_bands(need: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """露邊區域的四條外框帶 (x, y, 寬, 高):只對這些地方找前後格,省下九成以上的運算。"""
+    h, w = need.shape
+    if not need.any():
+        return []
+    def depth(m):  # 每一列(行)從邊緣算起連續露邊的長度,取最大
+        filled = ~m
+        d = np.where(filled.any(axis=0), filled.argmax(axis=0), m.shape[0])
+        return int(d.max())
+    # 先算左右帶(整條邊露出時,左右帶就是整欄),上下帶只看中間的欄,避免退化成整張畫面
+    l, r = depth(need.T), depth(need.T[::-1])
+    inner = need[:, l:w - r]
+    t, b = (depth(inner), depth(inner[::-1])) if inner.size else (0, 0)
+    rects = [(0, 0, l, h), (w - r, 0, r, h), (l, 0, w - l - r, t), (l, h - b, w - l - r, b)]
+    return [(x, y, rw, rh) for x, y, rw, rh in rects if rw > 0 and rh > 0]
+
+
+def fill_borders(out: np.ndarray, cov: np.ndarray, k: int, frames: dict, smooth_path: np.ndarray,
+                 traj: np.ndarray, zoom: float) -> int:
+    """用前後格的真實畫面補第 k 格防手震後露出的邊緣(就地修改 out),回傳仍補不到的像素數。
+
+    frames:{格號: 原始影格} 只需包含 k 附近的格子(由近到遠嘗試)。
+    第 j 格畫到第 k 格的穩定座標系,修正量 = 平滑路徑_k - 原始軌跡_j(與一般防手震同一套幾何)。
+    遠處背景跟著鏡頭走,搬過來就對得上;剛好在邊緣移動的人可能會有些微錯位。
+    補不到的少數像素維持 BORDER_REPLICATE(延伸邊緣)的結果。
+    """
+    h, w = out.shape[:2]
+    need = cov == 0
+    rects = _border_bands(need)
+    if not rects:
+        return 0
+    order = sorted((j for j in frames if j != k), key=lambda j: (abs(j - k), j))
+    for j in order:
+        m = _stab_matrix(w, h, smooth_path[k] - traj[j], zoom)
+        src = frames[j]
+        ones = None
+        for x, y, rw, rh in rects:
+            sub = need[y:y + rh, x:x + rw]
+            if not sub.any():
+                continue
+            ms = m.copy(); ms[0, 2] -= x; ms[1, 2] -= y
+            if ones is None:
+                ones = np.ones(src.shape[:2], np.uint8)
+            c = cv2.warpAffine(ones, ms.astype(np.float32), (rw, rh), flags=cv2.INTER_NEAREST)
+            take = sub & (c > 0)
+            if take.any():
+                part = cv2.warpAffine(src, ms.astype(np.float32), (rw, rh), flags=cv2.INTER_LANCZOS4,
+                                      borderMode=cv2.BORDER_REPLICATE)
+                out[y:y + rh, x:x + rw][take] = part[take]
+                sub &= ~take
+        if not need.any():
+            break
+    return int(need.sum())
 
 
 # --------------------------------------------------------------- 色調錨定

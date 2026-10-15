@@ -40,6 +40,7 @@ class EngineOptions {
     this.shakeThreshold = 0.4e-3,
     this.maxLongSide = 0,
     this.superRes = false,
+    this.fillBorders = true,
     this.srLongSide = 3840,
     this.srModel,
   });
@@ -64,6 +65,8 @@ class EngineOptions {
   // AI 超解析度:放大 4 倍後縮到長邊 [srLongSide](3840 = 4K)。開啟時取代 [enhance]。
   // [srModel] 為 ONNX 模型內容(見 superres.dart 的 srModelAsset)。
   final bool superRes;
+  // 補邊:防手震露出的邊緣用前後格的真實畫面補,只需少量放大,也因此能修正更大的晃動。
+  final bool fillBorders;
   final int srLongSide;
   final Uint8List? srModel;
 
@@ -372,6 +375,7 @@ class _RenderJob {
     required this.frames,
     required this.options,
     required this.corrections,
+    required this.trajectory,
     required this.rollingShutter,
     required this.zoom,
     required this.compression,
@@ -380,6 +384,7 @@ class _RenderJob {
   final int w, h, outW, outH, frames;
   final EngineOptions options;
   final Float64List? corrections; // 每格 3 個值:dx, dy, da
+  final Float64List? trajectory; // 補邊用:每格原始鏡頭軌跡 3 個值;null = 不補邊
   final Float64List? rollingShutter; // 每格 2×rsBands 個值:各條帶的果凍偏移
   final double zoom; // 防手震放大倍率
   final double compression; // 原片壓縮程度,決定提高畫質的降噪強度
@@ -402,16 +407,44 @@ void _renderEntry((Object, SendPort) args) {
         ? DetailEnhancer.level(o.enhanceLevel, compression: job.compression)
         : null;
     dehazer = o.dehaze ? Dehazer(strength: o.dehazeStrength, chroma: o.dehazeChroma) : null;
-    final frame = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC3);
     final c = job.corrections;
     final rsAll = job.rollingShutter;
+    final tr = job.trajectory;
     // AI 放大的實際速度(每格秒數,指數平均),顯示給使用者:手機上能不能用就看這個數字。
     final clock = Stopwatch();
     double? perFrame;
     const rsn = 2 * rsBands;
+    Motion at(Float64List v, int i) => Motion(v[3 * i], v[3 * i + 1], v[3 * i + 2]);
+    // 補邊要用到前後 win 格:先多讀進緩衝區。每格 BGR 在 4K 約 25 MB,總量控制在約 300 MB。
+    final win = tr == null ? 0 : (300e6 / (job.w * job.h * 3) / 2).floor().clamp(2, 15);
+    final buffer = <int, cv.Mat>{};
+    var nextRead = 0, eof = false;
+    List<Motion>? path, traj;
+    if (tr != null && c != null) {
+      traj = [for (var i = 0; i < tr.length ~/ 3; i++) at(tr, i)];
+      path = [
+        for (var i = 0; i < traj.length; i++)
+          i < c.length ~/ 3
+              ? Motion(traj[i].dx + c[3 * i], traj[i].dy + c[3 * i + 1], traj[i].da + c[3 * i + 2])
+              : traj[i],
+      ];
+    }
 
     for (var i = 0; i < job.frames; i++) {
-      if (!_readFully(fin, frame.data)) break;
+      while (!eof && nextRead <= i + win && nextRead < job.frames) {
+        final m = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC3);
+        if (!_readFully(fin, m.data)) {
+          m.dispose();
+          eof = true;
+          break;
+        }
+        buffer[nextRead++] = m;
+      }
+      final frame = buffer[i];
+      if (frame == null) break;
+      for (final j in buffer.keys.where((j) => j < i - win).toList()) {
+        buffer.remove(j)!.dispose();
+      }
       var cur = frame;
       cv.Mat step(cv.Mat next) {
         if (!identical(cur, frame)) cur.dispose();
@@ -422,8 +455,14 @@ void _renderEntry((Object, SendPort) args) {
         final rs = rsAll != null && rsn * (i + 1) <= rsAll.length
             ? Float64List.sublistView(rsAll, rsn * i, rsn * (i + 1))
             : null;
-        step(applyStabilization(cur, Motion(c[3 * i], c[3 * i + 1], c[3 * i + 2]), job.zoom,
-            rs: rs));
+        if (path != null && traj != null && i < traj.length) {
+          final (out, cov) = applyStabilizationWithCoverage(cur, at(c, i), job.zoom, rs: rs);
+          fillBorders(out, cov, i, buffer, path, traj, job.zoom);
+          cov.dispose();
+          step(out);
+        } else {
+          step(applyStabilization(cur, at(c, i), job.zoom, rs: rs));
+        }
       }
       // 色調錨定的參照:防手震之後、除霧與畫質之前的影格(位置對得上,亮度色彩是原片的)。
       final ref = anchor != null ? cur.clone() : null;
@@ -467,7 +506,9 @@ void _renderEntry((Object, SendPort) args) {
     }
     fin.closeSync();
     fout.closeSync(); // 關閉寫入端 → 編碼器讀到 EOF 後收尾
-    frame.dispose();
+    for (final m in buffer.values) {
+      m.dispose();
+    }
     port.send(const _Result(null));
   } catch (e) {
     port.send(_Failure('$e'));
@@ -505,7 +546,7 @@ Future<VideoReport> processVideo(
   }
 
   try {
-    Float64List? corrections, rollingShutter;
+    Float64List? corrections, rollingShutter, trajectory;
     var zoom = 1.0;
     var report = const VideoReport();
 
@@ -570,15 +611,27 @@ Future<VideoReport> processVideo(
         }
         // 鎖定需要的裁切太多(例如邊走邊拍)時,改用超強平滑。
         final lv = locked || level != StabilizeLevel.lock ? level : StabilizeLevel.extreme;
+        final fill = options.fillBorders;
         smooth ??= stabilizePath(list, workW, workH,
-            budget: lv.budget, rotBudget: lv.rotBudget, sigma: smoothingSigma(info.fps));
+            budget: fill ? lv.fillBudget : lv.budget,
+            rotBudget: fill ? lv.fillRotBudget : lv.rotBudget,
+            sigma: smoothingSigma(info.fps));
         // 果凍效應修正:高通的時間尺度約半秒(sigma = fps/2 格)。
         final rs = rollingShutterOffsets(residuals, info.fps / 2);
-        // 最終倍率要把果凍修正的條帶偏移也算進去,才不會露邊。
+        // 最終倍率要把果凍修正的條帶偏移也算進去,才不會露邊;補邊時只用其中約三成。
         zoom = options.zoom > 0
             ? options.zoom
-            : stabilizationZoom(smooth, workW, workH, maxZoom: lv.maxZoom, rs: rs);
+            : fill
+                ? fillZoom(stabilizationZoom(smooth, workW, workH, maxZoom: 3.0, rs: rs))
+                : stabilizationZoom(smooth, workW, workH, maxZoom: lv.maxZoom, rs: rs);
         corrections = Float64List.fromList([for (final m in smooth) ...[m.dx, m.dy, m.da]]);
+        if (fill) {
+          // 原始鏡頭軌跡(逐格累加),補邊時把前後格畫到目前格的穩定座標用
+          var x = 0.0, y = 0.0, a = 0.0;
+          trajectory = Float64List.fromList([
+            for (final m in list) ...[x += m.dx, y += m.dy, a += m.da],
+          ]);
+        }
         rollingShutter = Float64List.fromList([for (final r in rs) ...r]);
         report = VideoReport(shakeScore: jitter, stabilized: true, zoom: zoom, locked: locked);
       }
@@ -642,6 +695,7 @@ Future<VideoReport> processVideo(
         frames: frames,
         options: options,
         corrections: corrections,
+        trajectory: trajectory,
         rollingShutter: rollingShutter,
         zoom: zoom,
         compression: info.compression,

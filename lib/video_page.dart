@@ -556,9 +556,9 @@ class _VideoPageState extends State<VideoPage> {
                   icon: Icons.videocam_outlined,
                   title: '防手震',
                   subtitle: switch (_stabilizeLevel) {
-                    StabilizeLevel.standard => '含果凍修正,畫面裁切約 5~10%',
-                    StabilizeLevel.strong => '適合走路拍攝,裁切約 10~16%',
-                    StabilizeLevel.extreme => '晃很大或跟拍時用,裁切約 18~25%',
+                    StabilizeLevel.standard => '含果凍修正與補邊,畫面裁切約 3~5%',
+                    StabilizeLevel.strong => '適合走路拍攝,裁切約 5~8%',
+                    StabilizeLevel.extreme => '晃很大或跟拍時用,裁切約 8~12%',
                     StabilizeLevel.lock => '像架在腳架上完全不晃,裁切最多',
                   },
                   value: _stabilize,

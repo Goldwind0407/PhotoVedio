@@ -314,22 +314,46 @@ class Dehazer {
   return result;
 }
 
+/// 防手震的仿射矩陣係數 (cs, sn, tx, ty):dst = zoom·R(θ)·(src − c) + c + d。
+(double, double, double, double) _stabCoeffs(int w, int h, Motion c, double zoom) {
+  final cs = math.cos(c.da) * zoom, sn = math.sin(c.da) * zoom;
+  final cx = w / 2, cy = h / 2;
+  return (cs, sn, cx - cs * cx + sn * cy + c.dx, cy - sn * cx - cs * cy + c.dy);
+}
+
+cv.Mat _affine(double cs, double sn, double tx, double ty) =>
+    cv.Mat.fromList(2, 3, cv.MatType.CV_64FC1, [cs, -sn, tx, sn, cs, ty]);
+
 /// 套用補償量並以影格中心放大 [zoom] 倍,裁掉黑邊。回傳新的 Mat。
 ///
 /// [rs] 為各條帶的果凍偏移(見 [rollingShutterOffsets]):每 [strip] 列各自多平移 -偏移,
 /// 偏移在條帶中心之間線性內插,條帶交界不會有斷層。
 /// 對應 python_engine/algorithms.py 的 apply_stabilization。
-cv.Mat applyStabilization(cv.Mat frame, Motion c, double zoom, {Float64List? rs, int strip = 16}) {
+cv.Mat applyStabilization(cv.Mat frame, Motion c, double zoom, {Float64List? rs, int strip = 16}) =>
+    _stabilize(frame, c, zoom, rs, strip, null);
+
+/// 同 [applyStabilization],另外回傳覆蓋遮罩(8UC1,1 = 這個輸出像素有取到原影格,0 = 露邊),給 [fillBorders] 用。
+(cv.Mat, cv.Mat) applyStabilizationWithCoverage(cv.Mat frame, Motion c, double zoom,
+    {Float64List? rs, int strip = 16}) {
+  final cov = cv.Mat.zeros(frame.rows, frame.cols, cv.MatType.CV_8UC1);
+  return (_stabilize(frame, c, zoom, rs, strip, cov), cov);
+}
+
+cv.Mat _stabilize(cv.Mat frame, Motion c, double zoom, Float64List? rs, int strip, cv.Mat? cov) {
   final w = frame.cols, h = frame.rows;
-  final cs = math.cos(c.da) * zoom, sn = math.sin(c.da) * zoom;
-  final cx = w / 2, cy = h / 2;
-  final tx = cx - cs * cx + sn * cy + c.dx, ty = cy - sn * cx - cs * cy + c.dy;
+  final (cs, sn, tx, ty) = _stabCoeffs(w, h, c, zoom);
+  final cy = h / 2;
+  final ones = cov == null ? null : cv.Mat.fromScalar(h, w, cv.MatType.CV_8UC1, cv.Scalar(1, 0, 0, 0));
   cv.Mat warp(double ox, double oy, int y0, int rows) {
-    final m = cv.Mat.fromList(2, 3, cv.MatType.CV_64FC1, [
-      cs, -sn, tx - ox, //
-      sn, cs, ty - oy - y0,
-    ]);
+    final m = _affine(cs, sn, tx - ox, ty - oy - y0);
     try {
+      if (cov != null) {
+        final c = cv.warpAffine(ones!, m, (w, rows), flags: cv.INTER_NEAREST, borderMode: cv.BORDER_CONSTANT);
+        final dst = cov.region(cv.Rect(0, y0, w, rows));
+        c.copyTo(dst);
+        dst.dispose();
+        c.dispose();
+      }
       // Lanczos 取樣:雙線性在放大時會把細節抹掉約三成,Lanczos 只損失約一成。
       return cv.warpAffine(frame, m, (w, rows),
           flags: cv.INTER_LANCZOS4, borderMode: cv.BORDER_REPLICATE);
@@ -338,29 +362,96 @@ cv.Mat applyStabilization(cv.Mat frame, Motion c, double zoom, {Float64List? rs,
     }
   }
 
-  if (rs == null || rs.every((v) => v == 0)) return warp(0, 0, 0, h);
-  final bands = rs.length ~/ 2;
-  double interp(double y, int axis) {
-    // 條帶中心 (i + 0.5) * h / bands 之間線性內插,兩端外持平(同 np.interp)。
-    final pos = y / h * bands - 0.5;
-    if (pos <= 0) return rs[axis];
-    if (pos >= bands - 1) return rs[2 * (bands - 1) + axis];
-    final i = pos.floor(), f = pos - i;
-    return rs[2 * i + axis] * (1 - f) + rs[2 * (i + 1) + axis] * f;
-  }
+  try {
+    if (rs == null || rs.every((v) => v == 0)) return warp(0, 0, 0, h);
+    final bands = rs.length ~/ 2;
+    double interp(double y, int axis) {
+      // 條帶中心 (i + 0.5) * h / bands 之間線性內插,兩端外持平(同 np.interp)。
+      final pos = y / h * bands - 0.5;
+      if (pos <= 0) return rs[axis];
+      if (pos >= bands - 1) return rs[2 * (bands - 1) + axis];
+      final i = pos.floor(), f = pos - i;
+      return rs[2 * i + axis] * (1 - f) + rs[2 * (i + 1) + axis] * f;
+    }
 
-  final out = cv.Mat.zeros(h, w, frame.type);
-  for (var y0 = 0; y0 < h; y0 += strip) {
-    final rows = math.min(strip, h - y0);
-    // 輸出列對應的原影格列(忽略微小旋轉):果凍偏移是按原影格的列量測的。
-    final yc = cy + (y0 + rows / 2 - cy - c.dy) / zoom;
-    final part = warp(interp(yc, 0), interp(yc, 1), y0, rows);
-    final dst = out.region(cv.Rect(0, y0, w, rows));
-    part.copyTo(dst);
-    dst.dispose();
-    part.dispose();
+    final out = cv.Mat.zeros(h, w, frame.type);
+    for (var y0 = 0; y0 < h; y0 += strip) {
+      final rows = math.min(strip, h - y0);
+      // 輸出列對應的原影格列(忽略微小旋轉):果凍偏移是按原影格的列量測的。
+      final yc = cy + (y0 + rows / 2 - cy - c.dy) / zoom;
+      final part = warp(interp(yc, 0), interp(yc, 1), y0, rows);
+      final dst = out.region(cv.Rect(0, y0, w, rows));
+      part.copyTo(dst);
+      dst.dispose();
+      part.dispose();
+    }
+    return out;
+  } finally {
+    ones?.dispose();
   }
-  return out;
+}
+
+/// 用前後格的真實畫面補第 [k] 格防手震後露出的邊緣(就地修改 [out]),回傳仍補不到的像素數。
+///
+/// [frames]:{格號: 原始影格},只需包含 k 附近的格子(由近到遠嘗試)。
+/// 第 j 格畫到第 k 格的穩定座標系,修正量 = 平滑路徑_k − 原始軌跡_j(與一般防手震同一套幾何)。
+/// 遠處背景跟著鏡頭走,搬過來就對得上;剛好在邊緣移動的人可能會有些微錯位。
+/// 補不到的少數像素維持延伸邊緣的結果。對應 python_engine/algorithms.py 的 fill_borders。
+int fillBorders(cv.Mat out, cv.Mat cov, int k, Map<int, cv.Mat> frames, List<Motion> path,
+    List<Motion> traj, double zoom) {
+  final w = out.cols, h = out.rows;
+  final rects = borderBands(cov.data, w, h);
+  if (rects.isEmpty) return 0;
+  // need:1 = 還沒補到
+  final need = cv.Mat.zeros(h, w, cv.MatType.CV_8UC1);
+  final nd = need.data, cd = cov.data;
+  for (var i = 0; i < nd.length; i++) {
+    nd[i] = cd[i] == 0 ? 1 : 0;
+  }
+  final order = frames.keys.where((j) => j != k).toList()
+    ..sort((a, b) {
+      final d = (a - k).abs().compareTo((b - k).abs());
+      return d != 0 ? d : a.compareTo(b);
+    });
+  cv.Mat? ones;
+  try {
+    for (final j in order) {
+      final p = path[k], t = traj[j];
+      final (cs, sn, tx, ty) = _stabCoeffs(w, h, Motion(p.dx - t.dx, p.dy - t.dy, p.da - t.da), zoom);
+      final src = frames[j]!;
+      for (final (x, y, rw, rh) in rects) {
+        final needSub = need.region(cv.Rect(x, y, rw, rh));
+        try {
+          if (cv.countNonZero(needSub) == 0) continue;
+          final m = _affine(cs, sn, tx - x, ty - y);
+          ones ??= cv.Mat.fromScalar(src.rows, src.cols, cv.MatType.CV_8UC1, cv.Scalar(1, 0, 0, 0));
+          final c = cv.warpAffine(ones, m, (rw, rh), flags: cv.INTER_NEAREST, borderMode: cv.BORDER_CONSTANT);
+          final take = cv.bitwiseAND(needSub, c);
+          if (cv.countNonZero(take) > 0) {
+            final part = cv.warpAffine(src, m, (rw, rh),
+                flags: cv.INTER_LANCZOS4, borderMode: cv.BORDER_REPLICATE);
+            final outSub = out.region(cv.Rect(x, y, rw, rh));
+            part.copyTo(outSub, mask: take);
+            final left = cv.subtract(needSub, take);
+            left.copyTo(needSub);
+            for (final x in [part, outSub, left]) {
+              x.dispose();
+            }
+          }
+          for (final x in [m, c, take]) {
+            x.dispose();
+          }
+        } finally {
+          needSub.dispose();
+        }
+      }
+      if (cv.countNonZero(need) == 0) break;
+    }
+    return cv.countNonZero(need);
+  } finally {
+    ones?.dispose();
+    need.dispose();
+  }
 }
 
 // --------------------------------------------------------------- 色調錨定
