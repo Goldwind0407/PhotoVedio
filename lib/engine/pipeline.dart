@@ -405,6 +405,9 @@ void _renderEntry((Object, SendPort) args) {
     final frame = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC3);
     final c = job.corrections;
     final rsAll = job.rollingShutter;
+    // AI 放大的實際速度(每格秒數,指數平均),顯示給使用者:手機上能不能用就看這個數字。
+    final clock = Stopwatch();
+    double? perFrame;
     const rsn = 2 * rsBands;
 
     for (var i = 0; i < job.frames; i++) {
@@ -426,7 +429,15 @@ void _renderEntry((Object, SendPort) args) {
       final ref = anchor != null ? cur.clone() : null;
       if (dehazer != null) step(dehazer(cur));
       if (enhancer != null) step(enhancer(cur));
-      if (sr != null) step(sr(cur));
+      if (sr != null) {
+        clock
+          ..reset()
+          ..start();
+        step(sr(cur));
+        final s = clock.elapsedMicroseconds / 1e6;
+        // 第一格含模型載入與硬體編譯,不列入平均
+        if (i > 0) perFrame = perFrame == null ? s : 0.8 * perFrame + 0.2 * s;
+      }
       if (cur.cols != job.outW || cur.rows != job.outH) {
         // AI 放大 4 倍後縮到目標尺寸用 INTER_AREA(縮小不產生鋸齒);其餘放大用 Lanczos。
         final shrink = cur.cols > job.outW;
@@ -446,7 +457,12 @@ void _renderEntry((Object, SendPort) args) {
       if (!identical(cur, frame)) cur.dispose();
       // AI 放大每格要好幾秒,每格都回報進度
       if (sr != null || i % 5 == 0) {
-        port.send(_Progress(sr != null ? '輸出影片(AI 放大)' : '輸出影片', (i + 1) / job.frames));
+        final pf = perFrame;
+        port.send(_Progress(
+            sr == null
+                ? '輸出影片'
+                : '輸出影片(AI 放大 · ${sr.backend}${pf == null ? '' : ' · 每格 ${pf.toStringAsFixed(1)} 秒'})',
+            (i + 1) / job.frames));
       }
     }
     fin.closeSync();

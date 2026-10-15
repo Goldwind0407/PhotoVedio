@@ -212,8 +212,10 @@ class _VideoPageState extends State<VideoPage> {
           _logProgress(at, '影片:$settings\n停在:$at\n記憶體用量:約 ${ProcessInfo.currentRss >> 20} MB');
           if (!mounted) return;
           setState(() {
-            if (stage != _etaStage) {
-              _etaStage = stage;
+            // 括號內是即時資訊(例如 AI 每格秒數),不算換階段
+            final key = stage.split('(').first;
+            if (key != _etaStage) {
+              _etaStage = key;
               _etaStart = DateTime.now();
             }
             _stage = stage;
