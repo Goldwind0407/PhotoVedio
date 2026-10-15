@@ -16,11 +16,11 @@ import time
 import cv2
 import numpy as np
 
-from algorithms import DetailEnhancer
+from algorithms import DetailEnhancer, compression_level
 from algorithms import (RS_BANDS, STABILIZE_LEVELS, apply_stabilization, estimate_motion_bands,
                         lock_trajectory, rolling_shutter_offsets, smoothing_sigma, stabilization_zoom,
                         stabilize_path)
-from roundtrip import FFMPEG, probe
+from roundtrip import FFMPEG, bitrate_info, probe
 
 ANALYSIS_LONG_SIDE = 1280
 SHAKE_THRESHOLD = 0.4e-3  # 與 App 相同:高頻抖動 / 畫面長邊
@@ -116,7 +116,11 @@ def main() -> int:
                             "-framerate", f"{fps}", "-i", "-", "-i", src, "-map", "0:v:0", "-map", "1:a:0?",
                             *codec, "-color_range", "tv", "-c:a", "copy", "-shortest",
                             "-movflags", "+faststart", dst], stdin=subprocess.PIPE)
-    enhancer = None if sr else DetailEnhancer()
+    bitrate, hevc = bitrate_info(src)
+    compression = compression_level(bitrate, w, h, fps, hevc)
+    enhancer = None if sr else DetailEnhancer(compression=compression)
+    if enhancer:
+        print(f"壓縮程度 {compression:.2f}(位元率 {bitrate / 1e6:.1f} Mbps)", flush=True)
     size, i, total = w * h * 3, 0, len(motions)
     while True:
         buf = dec.stdout.read(size)

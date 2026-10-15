@@ -30,6 +30,15 @@ def probe(path: str) -> tuple[int, int, float, bool]:
     return w // 2 * 2, h // 2 * 2, fps, "arib-std-b67" in line
 
 
+def bitrate_info(path: str) -> tuple[float, bool]:
+    """影像軌的位元率(bit/s,未知為 0)與是否為 HEVC,供 compression_level 估計壓縮程度。"""
+    import re
+    info = subprocess.run([FFMPEG, "-hide_banner", "-i", path], capture_output=True, text=True, encoding="utf-8", errors="replace").stderr
+    line = next((l for l in info.splitlines() if "Video:" in l), "")
+    m = re.search(r"(\d+) kb/s", line) or re.search(r"bitrate: (\d+) kb/s", info)
+    return (float(m.group(1)) * 1000 if m else 0.0), ("hevc" in line or "h265" in line)
+
+
 def run(src: str, dst: str, process, start: float, dur: float, crf: int = 12) -> None:
     w, h, fps, hdr = probe(src)
     m = "bt2020" if hdr else "bt709"

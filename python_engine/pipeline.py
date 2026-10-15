@@ -11,7 +11,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from algorithms import (RS_BANDS, STABILIZE_LEVELS, Dehazer, DetailEnhancer, ToneAnchor,
+from algorithms import (RS_BANDS, STABILIZE_LEVELS, Dehazer, DetailEnhancer, ToneAnchor, compression_level,
                         apply_stabilization, estimate_motion_bands, rolling_shutter_offsets,
                         smoothing_sigma, stabilization_zoom, stabilize_path)
 
@@ -99,7 +99,11 @@ def process_video(src: str, dst: str, opt: Options,
     dehazer = Dehazer(opt.dehaze_strength) if opt.dehaze else None
     # 新版畫質增強不改變色調;只有除霧會改變亮度分佈,才需要錨定回原片。
     anchor = ToneAnchor() if opt.tone_anchor and opt.dehaze else None
-    enhancer = DetailEnhancer.level(opt.enhance_level) if opt.enhance else None
+    enhancer = None
+    if opt.enhance:
+        from roundtrip import bitrate_info
+        bitrate, hevc = bitrate_info(src)
+        enhancer = DetailEnhancer.level(opt.enhance_level, compression_level(bitrate, w, h, fps, hevc))
     i = 0
     while True:
         ok, frame = cap.read()

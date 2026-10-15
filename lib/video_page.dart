@@ -588,7 +588,7 @@ class _VideoPageState extends State<VideoPage> {
                   _OptionTile(
                   icon: Icons.auto_awesome,
                   title: '提高畫質',
-                  subtitle: '增強紋理與輪廓,不改變色彩',
+                  subtitle: '去除壓縮雜訊,讓輪廓更清楚',
                   value: _enhance,
                   onChanged: (v) => setState(() => _enhance = v),
                   child: _Levels<EnhanceLevel>(

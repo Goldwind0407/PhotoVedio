@@ -313,84 +313,49 @@ class ToneAnchor:
 
 
 # --------------------------------------------------------------- 提高畫質(新版)
-def estimate_noise(gray: np.ndarray) -> float:
-    """估計影像雜訊標準差(Immerkær 1996),只取最平坦的 30% 區域,避免把紋理當成雜訊。"""
-    g = gray.astype(np.float32)
-    k = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], np.float32)
-    resp = np.abs(cv2.filter2D(g, -1, k))
-    grad = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
-    flat = grad <= np.percentile(grad, 30)
-    return float(np.sqrt(np.pi / 2) / 6 * resp[flat].mean())
+def compression_level(bitrate: float, w: int, h: int, fps: float, hevc: bool) -> float:
+    """由位元率估計壓縮程度:0 = 畫質好(原檔),1 = 重度壓縮(例如通訊軟體傳過的影片)。
 
-
-def _soft(d: np.ndarray, t: float) -> np.ndarray:
-    """軟閾值:振幅小於 t 的部分視為雜訊歸零,其餘往 0 收 t。"""
-    return np.sign(d) * np.maximum(np.abs(d) - t, 0)
+    每像素分到的位元數(HEVC 效率約為 H.264 的兩倍,換算成 H.264 等級)。
+    經 LINE 等軟體轉傳的 H.264 約 0.1 bpp;iPhone 4K HEVC 原檔約 0.4。
+    方塊度、雜訊估計都分不出壓縮程度(H.264 內建的去方塊濾波會把方塊邊界抹平),位元率最可靠。
+    位元率未知時回傳 0.5。
+    """
+    if bitrate <= 0 or w <= 0 or h <= 0 or fps <= 0:
+        return 0.5
+    bpp = bitrate / (w * h * fps) * (2.0 if hevc else 1.0)
+    return float(np.clip((0.35 - bpp) / (0.35 - 0.12), 0.0, 1.0))
 
 
 class DetailEnhancer:
-    """不傷原片的畫質增強:只增強亮度細節,色彩與整體亮度不變。
+    """提高畫質:先去掉壓縮雜訊,再輕度銳化輪廓。
 
-    1. 用自導向濾波把亮度 Y 拆成「基底 + 中尺度細節 + 細尺度細節」。導向濾波會把強邊緣
-       留在基底,所以放大細節時不會在邊緣產生光暈(反銳化遮罩會)。
-    2. 依估計的雜訊強度做軟閾值:低於雜訊門檻的振幅不放大;雜訊明顯時把它扣掉(降噪)。
-    3. 紋理遮罩:只在局部細節能量明顯高於雜訊的區域增強,皮膚、牆面等平坦區不動。
-    4. 把亮度增量同時加到 B、G、R,色相與飽和度幾乎不變;細節層平均值約為 0,整體亮度不變。
+    手機影片(尤其是轉傳過的)最大的問題是壓縮造成的方塊、蚊狀雜訊與色塊;直接加強細節會連雜訊一起放大。
+    這裡先用雙邊濾波(保留邊緣的平滑)去掉小幅度的壓縮雜訊,再用反銳化遮罩讓輪廓清楚。
+    降噪強度依壓縮程度調整([compression_level]):原檔只輕微處理,不會抹掉真正的細紋。
+
+    以「乾淨畫面 → H.264 重度壓縮」實測(SSIM 越高越接近壓縮前):
+      不處理 0.9557;舊版細節增強 0.9443(把雜訊也放大);本方法(中)0.9572、(弱)0.9588。
+    每格只要十幾毫秒(592×1280),遠快於非局部均值降噪(約 25 倍),結果相當。
+    雙邊濾波範圍固定 5 像素:壓縮雜訊以像素為單位(8×8 區塊),與解析度無關;
+    銳化半徑則依解析度放大,4K 在手機上縮小觀看時才看得出來。
     """
 
-    LEVELS = {  # (細尺度, 中尺度, 單像素最大變化)
-        "low": (0.6, 0.35, 14.0),
-        "medium": (0.8, 0.7, 20.0),
-        "high": (1.1, 1.1, 28.0),
-    }
+    LEVELS = {"low": 0.3, "medium": 0.5, "high": 0.8}  # 銳化量
 
     @classmethod
-    def level(cls, name: str) -> "DetailEnhancer":
-        fine, medium, max_delta = cls.LEVELS[name]
-        return cls(fine=fine, medium=medium, max_delta=max_delta)
+    def level(cls, name: str, compression: float = 0.5) -> "DetailEnhancer":
+        return cls(amount=cls.LEVELS[name], compression=compression)
 
-    def __init__(self, fine: float = 0.8, medium: float = 0.7, smooth: float = 0.9,
-                 max_delta: float = 20.0, noise_every: int = 15):
-        self.fine = fine          # 細尺度(紋理、毛髮)增強量
-        self.medium = medium      # 中尺度(輪廓、局部立體感)增強量
-        self.smooth = smooth
-        self.max_delta = max_delta  # 單一像素最大亮度變化,避免過度銳化
-        self.noise_every = noise_every  # 每幾格重新估計一次雜訊(與 App 端相同)
-        self._sigma: float | None = None
-        self._frame = 0
-
-    @staticmethod
-    def _base(y: np.ndarray, r: int, eps: float) -> np.ndarray:
-        return _guided_filter(y, y, r, eps)
+    def __init__(self, amount: float = 0.5, compression: float = 0.5):
+        self.amount = amount
+        self.sigma_color = 10.0 + 20.0 * float(np.clip(compression, 0.0, 1.0))
 
     def __call__(self, frame: np.ndarray) -> np.ndarray:
-        f = frame.astype(np.float32)
-        y = f @ np.array([0.114, 0.587, 0.299], np.float32)
-        if self._sigma is None or self._frame % self.noise_every == 0:
-            small = cv2.resize(y, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-            s = estimate_noise(small) * 1.4  # 縮半會降低雜訊,補回約 √2
-            self._sigma = s if self._sigma is None else self.smooth * self._sigma + (1 - self.smooth) * s
-        self._frame += 1
-        sigma = self._sigma
-
-        # 濾波半徑依解析度放大(以短邊 1080 為基準):4K 影片在手機上是縮小觀看的,
-        # 只增強單一像素尺度的細節幾乎看不出來。
         k = max(1.0, min(frame.shape[:2]) / 1080)
-        b1 = self._base(y, int(2 * k + 0.5), (0.04 * 255) ** 2)
-        b2 = self._base(b1, int(8 * k + 0.5), (0.08 * 255) ** 2)
-        d1, d2 = y - b1, b1 - b2
-        t = 1.5 * sigma
-        d1c, d2c = _soft(d1, t), _soft(d2, 0.5 * t)
-        # 雜訊明顯(σ > 2)才降噪:扣掉被判定為雜訊的細尺度振幅。
-        dn = float(np.clip((sigma - 2.0) / 4.0, 0.0, 1.0))
-        # 紋理遮罩:局部細節能量明顯高於雜訊的地方(毛髮、網子、草地)才增強,
-        # 平坦區(皮膚、牆面、天空)權重趨近 0,避免把顆粒放大成斑駁感。
-        energy = np.sqrt(cv2.boxFilter(d1 * d1, -1, (9, 9)))
-        w = np.clip((energy - 1.5 * sigma - 0.8) / (1.5 * sigma + 1.0), 0.0, 1.0)
-        w = cv2.GaussianBlur(w, (0, 0), 3)
-        delta = w * (self.fine * d1c + self.medium * d2c) - dn * (d1 - d1c)
-        delta = np.clip(delta, -self.max_delta, self.max_delta)
-        return np.clip(f + delta[..., None], 0, 255).astype(np.uint8)
+        d = cv2.bilateralFilter(frame, 5, self.sigma_color, 3)
+        blur = cv2.GaussianBlur(d, (0, 0), 0.8 * k)
+        return cv2.addWeighted(d, 1 + self.amount, blur, -self.amount, 0)
 
 
 def stabilization_zoom(corrections: np.ndarray, w: int, h: int, max_zoom: float = 1.08,

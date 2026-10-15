@@ -598,7 +598,7 @@ class _PhotoEditorPageState extends State<PhotoEditorPage> {
               child: _ToggleCard(
                 icon: Icons.auto_awesome,
                 title: '提高畫質',
-                subtitle: '增強細節與輪廓',
+                subtitle: '去雜訊、輪廓更清楚',
                 selected: _enhance,
                 onTap: () {
                   setState(() => _enhance = !_enhance);

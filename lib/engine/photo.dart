@@ -92,9 +92,8 @@ PhotoResult processPhoto(Uint8List bytes, PhotoOptions o) {
       cur = keep(dehazer(cur));
     }
     if (o.enhance) {
-      // 每條約 0.5M 像素:2M 像素時 12MP 照片峰值近 1GB,手機容易被系統砍掉。
-      final strips = math.max(4, (cur.cols * cur.rows / (1 << 19)).ceil());
-      cur = keep(DetailEnhancer(strips: strips)(cur));
+      // 照片無法從檔案判斷壓縮程度,用中等降噪。
+      cur = keep(DetailEnhancer()(cur));
     }
     if (o.dehaze) {
       cur = keep(ToneAnchor()(ref, cur));

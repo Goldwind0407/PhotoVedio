@@ -44,7 +44,7 @@ class EngineOptions {
     this.srModel,
   });
 
-  final bool enhance; // 提高畫質:雜訊感知、邊緣感知的亮度細節增強(DetailEnhancer)
+  final bool enhance; // 提高畫質:依壓縮程度降噪,再輕度銳化(DetailEnhancer)
   final EnhanceLevel enhanceLevel;
   final bool dehaze;
   final double dehazeStrength;
@@ -129,11 +129,12 @@ const analysisLongSide = 1280;
 // ------------------------------------------------------------------ 影片資訊
 
 class VideoInfo {
-  const VideoInfo(this.width, this.height, this.fps, this.frames, this.color);
+  const VideoInfo(this.width, this.height, this.fps, this.frames, this.color, this.compression);
   final int width, height; // 已轉正、且為偶數
   final double fps;
   final int frames;
   final ColorInfo color;
+  final double compression; // 壓縮程度 0~1(見 compressionLevel)
 }
 
 /// 原片的色彩規格。iPhone 預設錄的是 HDR(HEVC 10-bit、BT.2020、HLG 曲線),
@@ -207,7 +208,12 @@ Future<VideoInfo> _probe(String src) async {
   final nb = int.tryParse('${props['nb_frames']}');
   final frames = nb ?? (duration * fps).round();
   if (w <= 0 || h <= 0 || frames <= 0) throw Exception('影片資訊不完整');
-  return VideoInfo(w ~/ 2 * 2, h ~/ 2 * 2, fps, frames, ColorInfo.fromProps(props));
+  // 影像軌位元率;沒有時用整個檔案的位元率(含音軌,略高估,影響不大)
+  final bitrate = double.tryParse(v.getBitrate() ?? '') ?? double.tryParse(info.getBitrate() ?? '') ?? 0;
+  final codec = (v.getCodec() ?? '').toLowerCase();
+  final compression =
+      compressionLevel(bitrate, w, h, fps, hevc: codec.contains('hevc') || codec.contains('265'));
+  return VideoInfo(w ~/ 2 * 2, h ~/ 2 * 2, fps, frames, ColorInfo.fromProps(props), compression);
 }
 
 // ------------------------------------------------------------------ FFmpeg / 管道
@@ -368,6 +374,7 @@ class _RenderJob {
     required this.corrections,
     required this.rollingShutter,
     required this.zoom,
+    required this.compression,
   });
   final String inPipe, outPipe;
   final int w, h, outW, outH, frames;
@@ -375,6 +382,7 @@ class _RenderJob {
   final Float64List? corrections; // 每格 3 個值:dx, dy, da
   final Float64List? rollingShutter; // 每格 2×rsBands 個值:各條帶的果凍偏移
   final double zoom; // 防手震放大倍率
+  final double compression; // 原片壓縮程度,決定提高畫質的降噪強度
 }
 
 void _renderEntry((Object, SendPort) args) {
@@ -391,7 +399,7 @@ void _renderEntry((Object, SendPort) args) {
     sr = o.superRes ? SuperResolver(o.srModel!) : null;
     // AI 放大本身就會補細節、讓邊緣銳利,再疊細節增強反而過頭,所以兩者擇一。
     final enhancer = o.enhance && sr == null
-        ? DetailEnhancer.level(o.enhanceLevel)
+        ? DetailEnhancer.level(o.enhanceLevel, compression: job.compression)
         : null;
     dehazer = o.dehaze ? Dehazer(strength: o.dehazeStrength, chroma: o.dehazeChroma) : null;
     final frame = cv.Mat.zeros(job.h, job.w, cv.MatType.CV_8UC3);
@@ -620,6 +628,7 @@ Future<VideoReport> processVideo(
         corrections: corrections,
         rollingShutter: rollingShutter,
         zoom: zoom,
+        compression: info.compression,
       ),
       progress,
     ).whenComplete(() => finished = true);
