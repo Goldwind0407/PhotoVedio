@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-MODEL = Path(__file__).resolve().parent.parent / "assets" / "models" / "realesr-general-x4v3.onnx"
+MODEL = Path(__file__).resolve().parent / "models" / "realesr-general-x4v3.onnx"
 SCALE = 4
 TILE = 320
 OVERLAP = 40

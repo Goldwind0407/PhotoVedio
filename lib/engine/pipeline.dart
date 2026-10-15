@@ -22,7 +22,6 @@ import 'package:ffmpeg_kit_min_gpl/return_code.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 import 'algorithms.dart';
-import 'superres.dart';
 
 class EngineOptions {
   const EngineOptions({
@@ -39,10 +38,7 @@ class EngineOptions {
     this.maxFrames = 0,
     this.shakeThreshold = 0.4e-3,
     this.maxLongSide = 0,
-    this.superRes = false,
     this.fillBorders = true,
-    this.srLongSide = 3840,
-    this.srModel,
   });
 
   final bool enhance; // 提高畫質:依壓縮程度降噪,再輕度銳化(DetailEnhancer)
@@ -62,15 +58,10 @@ class EngineOptions {
   // 工作解析度上限(長邊像素)。4K 單格 BGR 就 25 MB、浮點中間結果更大,
   // 手機記憶體撐不住,所以解碼時就先縮小。0 = 保持原尺寸。
   final int maxLongSide;
-  // AI 超解析度:放大 4 倍後縮到長邊 [srLongSide](3840 = 4K)。開啟時取代 [enhance]。
-  // [srModel] 為 ONNX 模型內容(見 superres.dart 的 srModelAsset)。
-  final bool superRes;
   // 補邊:防手震露出的邊緣用前後格的真實畫面補,只需少量放大,也因此能修正更大的晃動。
   final bool fillBorders;
-  final int srLongSide;
-  final Uint8List? srModel;
 
-  bool get any => enhance || dehaze || stabilize || superRes;
+  bool get any => enhance || dehaze || stabilize;
 }
 
 typedef ProgressCallback = void Function(String stage, double fraction);
@@ -82,18 +73,12 @@ class VideoReport {
     this.stabilized = false,
     this.zoom = 1.0,
     this.locked = false,
-    this.outWidth = 0,
-    this.outHeight = 0,
   });
 
   final double? shakeScore; // null = 沒開防手震
   final bool stabilized; // false = 偵測為穩定而略過
   final double zoom; // 防手震的放大倍率
   final bool locked; // 用了三腳架鎖定
-  final int outWidth, outHeight; // 輸出影片尺寸
-
-  VideoReport withSize(int w, int h) => VideoReport(
-      shakeScore: shakeScore, stabilized: stabilized, zoom: zoom, locked: locked, outWidth: w, outHeight: h);
 }
 
 /// 晃動分數:軌跡偏離其移動平均(視窗 15 格)的平均距離,除以畫面長邊。
@@ -395,24 +380,17 @@ void _renderEntry((Object, SendPort) args) {
   final o = job.options;
   Dehazer? dehazer;
   ToneAnchor? anchor;
-  SuperResolver? sr;
   try {
     final fin = File(job.inPipe).openSync();
     final fout = File(job.outPipe).openSync(mode: FileMode.writeOnly);
     // 新版畫質增強不改變色調;只有除霧會改變亮度分佈,才需要錨定回原片。
     anchor = o.toneAnchor && o.dehaze ? ToneAnchor(chroma: o.anchorChroma) : null;
-    sr = o.superRes ? SuperResolver(o.srModel!) : null;
-    // AI 放大本身就會補細節、讓邊緣銳利,再疊細節增強反而過頭,所以兩者擇一。
-    final enhancer = o.enhance && sr == null
-        ? DetailEnhancer.level(o.enhanceLevel, compression: job.compression)
-        : null;
+    final enhancer =
+        o.enhance ? DetailEnhancer.level(o.enhanceLevel, compression: job.compression) : null;
     dehazer = o.dehaze ? Dehazer(strength: o.dehazeStrength, chroma: o.dehazeChroma) : null;
     final c = job.corrections;
     final rsAll = job.rollingShutter;
     final tr = job.trajectory;
-    // AI 放大的實際速度(每格秒數,指數平均),顯示給使用者:手機上能不能用就看這個數字。
-    final clock = Stopwatch();
-    double? perFrame;
     const rsn = 2 * rsBands;
     Motion at(Float64List v, int i) => Motion(v[3 * i], v[3 * i + 1], v[3 * i + 2]);
     // 補邊要用到前後 win 格:先多讀進緩衝區。每格 BGR 在 4K 約 25 MB,總量控制在約 300 MB。
@@ -468,20 +446,8 @@ void _renderEntry((Object, SendPort) args) {
       final ref = anchor != null ? cur.clone() : null;
       if (dehazer != null) step(dehazer(cur));
       if (enhancer != null) step(enhancer(cur));
-      if (sr != null) {
-        clock
-          ..reset()
-          ..start();
-        step(sr(cur));
-        final s = clock.elapsedMicroseconds / 1e6;
-        // 第一格含模型載入與硬體編譯,不列入平均
-        if (i > 0) perFrame = perFrame == null ? s : 0.8 * perFrame + 0.2 * s;
-      }
       if (cur.cols != job.outW || cur.rows != job.outH) {
-        // AI 放大 4 倍後縮到目標尺寸用 INTER_AREA(縮小不產生鋸齒);其餘放大用 Lanczos。
-        final shrink = cur.cols > job.outW;
-        step(cv.resize(cur, (job.outW, job.outH),
-            interpolation: shrink ? cv.INTER_AREA : cv.INTER_LANCZOS4));
+        step(cv.resize(cur, (job.outW, job.outH), interpolation: cv.INTER_LANCZOS4));
       }
       if (ref != null) {
         // 開「放大」時輸出比參照圖大,參照圖也要放大到相同尺寸。
@@ -494,15 +460,7 @@ void _renderEntry((Object, SendPort) args) {
       }
       fout.writeFromSync(cur.data);
       if (!identical(cur, frame)) cur.dispose();
-      // AI 放大每格要好幾秒,每格都回報進度
-      if (sr != null || i % 5 == 0) {
-        final pf = perFrame;
-        port.send(_Progress(
-            sr == null
-                ? '輸出影片'
-                : '輸出影片(AI 放大 · ${sr.backend}${pf == null ? '' : ' · 每格 ${pf.toStringAsFixed(1)} 秒'})',
-            (i + 1) / job.frames));
-      }
+      if (i % 5 == 0) port.send(_Progress('輸出影片', (i + 1) / job.frames));
     }
     fin.closeSync();
     fout.closeSync(); // 關閉寫入端 → 編碼器讀到 EOF 後收尾
@@ -513,7 +471,6 @@ void _renderEntry((Object, SendPort) args) {
   } catch (e) {
     port.send(_Failure('$e'));
   } finally {
-    sr?.release();
     dehazer?.dispose();
   }
 }
@@ -639,8 +596,7 @@ Future<VideoReport> processVideo(
 
     _checkCancelled();
     // ---- 階段 2:解碼 → OpenCV → 編碼 ----
-    final (outW, outH) =
-        options.superRes ? srTargetSize(workW, workH, options.srLongSide) : (workW, workH);
+    final outW = workW, outH = workH;
     final inPipe = await newPipe();
     final outPipe = await newPipe();
     var finished = false;
@@ -711,7 +667,7 @@ Future<VideoReport> processVideo(
     if (!ReturnCode.isSuccess(enc)) {
       throw Exception('編碼失敗:$_lastFfmpegError');
     }
-    return report.withSize(outW, outH);
+    return report;
   } catch (_) {
     // 取消後各階段會因管道中斷而各自報錯,統一成「已取消」,並刪掉不完整的輸出檔。
     try {

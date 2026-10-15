@@ -26,10 +26,6 @@
   - 先去除壓縮雜訊再銳化輪廓；降噪強度依影片的壓縮程度（位元率）自動調整。
   - 每格只要十幾毫秒，幾乎不增加處理時間。
 - **除霧**：只在有明顯霧氣時使用，否則會改變原片色調。
-- **AI 放大到 4K**（Real-ESRGAN）：放大 4 倍後縮到長邊 3840，補出細節、清掉壓縮雜訊，適合解析度低或被通訊軟體壓縮過的影片。
-  - 非常耗運算：每個輸入像素約 240 萬次浮點運算，592×1280 的影格約 1.8 TFLOP。手機上會優先用 GPU/NPU（Android NNAPI、iPhone CoreML），不支援時退回 CPU。
-  - 實測（4 核心 CPU、onnxruntime）：592×1280 每格約 11 秒。有獨立顯示卡的電腦會快很多，長影片建議用電腦版。
-  - 開啟時取代「提高畫質」；皮膚等平滑區域會被抹得比較乾淨。
 - **防手震**
   - **標準**：畫面裁切約 3～5%。
   - **強**：適合走路拍攝，裁切約 5～8%。
@@ -90,11 +86,12 @@
 | 原片 | 3.6px | 3.6px |
 | 處理後 | 0.38px | 0.38px |
 
-### AI 超解析度
-- 模型：Real-ESRGAN `realesr-general-x4v3`（SRVGGNetCompact，120 萬參數，BSD 3-Clause，授權見 `assets/models/LICENSE-Real-ESRGAN.txt`）。
-- `python_engine/convert_sr_model.py` 不需要 PyTorch 就能把官方 `.pth` 權重轉成 ONNX；轉好的模型放在 `assets/models/`，App 與電腦版共用。
+### AI 超解析度（只有電腦版）
+- 模型：Real-ESRGAN `realesr-general-x4v3`（SRVGGNetCompact，120 萬參數，BSD 3-Clause，授權見 `python_engine/models/LICENSE-Real-ESRGAN.txt`），放大 4 倍後縮到長邊 3840。
+- `python_engine/convert_sr_model.py` 不需要 PyTorch 就能把官方 `.pth` 權重轉成 ONNX；轉好的模型放在 `python_engine/models/`。
 - 大畫面分塊處理，每塊多取 40 像素重疊（大於網路的作用範圍），結果與整張處理完全相同。
-- App（Dart，onnxruntime）與電腦版（Python）的輸出最大差 1 個灰階（四捨五入誤差）。
+- 非常耗運算：每個輸入像素約 240 萬次浮點運算，592×1280 的影格約 1.8 TFLOP。實測 4 核心 CPU 每格約 11 秒；有獨立顯示卡的電腦會快很多。
+- **App 已移除這個功能**：iPhone 實測即使用 CoreML 加速，每格仍要 21.5 秒（42 秒的影片約 8 小時、手機嚴重發熱），而且在手機螢幕上看不出畫質差別。
 
 ### 提高畫質
 手機影片（尤其是轉傳過的）最大的問題是壓縮造成的方塊、蚊狀雜訊和色塊，直接加強細節會連雜訊一起放大。
@@ -120,8 +117,6 @@ lib/
     algorithms.dart      影像演算法(運動估計、除霧、提高畫質、色調錨定、套用防手震)
     trajectory.dart      鏡頭路徑計算(平滑、鎖定、果凍偏移;純 Dart,不依賴 OpenCV)
     photo.dart           照片的除霧/提高畫質
-    superres.dart        AI 超解析度(onnxruntime)
-assets/models/           AI 超解析度模型與授權
   smoke_main.dart        實機驗證用入口(影片)
   photo_smoke_main.dart  實機驗證用入口(照片)
 test/                    單元測試
@@ -138,8 +133,7 @@ python_engine/           電腦版演算法與驗證工具(與 lib/engine 逐函
 flutter pub get
 flutter run            # 連接手機後執行
 flutter analyze
-# test/superres_test.dart 需要 onnxruntime 原生函式庫(套件內附 Linux 版):
-LD_LIBRARY_PATH=~/.pub-cache/hosted/pub.dev/onnxruntime-1.4.1/linux flutter test
+flutter test
 ```
 
 - 影片處理使用 `ffmpeg_kit_min_gpl`，支援 Android、iOS、macOS。

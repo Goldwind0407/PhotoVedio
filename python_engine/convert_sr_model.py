@@ -1,7 +1,7 @@
 """不用 PyTorch,把 Real-ESRGAN SRVGGNetCompact 的 .pth 權重轉成 ONNX。
 用法:python convert_sr_model.py 權重.pth 輸出.onnx
 權重下載:https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
-(轉好的模型已放在 assets/models/,App 與電腦版共用,一般不需要再轉。)
+(轉好的模型已放在 python_engine/models/,一般不需要再轉。)
 .pth 是 zip 包著 pickle;只允許重建張量所需的少數類別,不執行其他任何程式。"""
 import pickle, sys, zipfile, collections
 import numpy as np
